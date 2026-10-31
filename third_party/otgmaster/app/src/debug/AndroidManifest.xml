@@ -1,0 +1,89 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Debug-only: a backup between two mounted partitions with no UI. See BackupTestReceiver. -->
+        <receiver
+            android:name=".bench.BackupTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.fayaz.otgmaster.RUN_BACKUP" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          Debug-only benchmark trigger. Declared in the debug source set alone, so
+          release builds contain neither this entry nor the classes behind it.
+
+          The broadcast must name this component explicitly: since Android 8,
+          manifest-declared receivers do not receive implicit broadcasts, so an
+          action-only broadcast is accepted and silently dropped.
+
+          An optional string extra named "tests" selects a subset of sections
+          (free, block, dir, path, seq, random, opens), since a full pass takes
+          minutes. See BenchmarkReceiver for the exact commands.
+        -->
+        <receiver
+            android:name=".bench.BenchmarkReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.fayaz.otgmaster.RUN_BENCHMARK" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          Debug-only: copies a mounted partition's raw sectors to a file adb can
+          pull, so the host can run filesystem checkers against exactly what is on
+          the drive without moving it. See VolumeDumpReceiver.
+        -->
+        <!-- Debug-only: mount/unmount with no UI, for companion-app E2E. See E2eMountReceiver. -->
+        <receiver
+            android:name=".bench.E2eMountReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.fayaz.otgmaster.E2E_MOUNT" />
+                <action android:name="app.fayaz.otgmaster.E2E_UNMOUNT_ALL" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".bench.VolumeDumpReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.fayaz.otgmaster.DUMP_VOLUME" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          Debug-only spike: does a FUSE-backed ParcelFileDescriptor created in one
+          process still work after being relayed through another? Runs in its own
+          process to stand in for a per-drive mount process. See FdRelayService.
+        -->
+        <service
+            android:name=".spike.FdRelayService"
+            android:process=":mount0"
+            android:exported="false" />
+
+        <receiver
+            android:name=".spike.FdSpikeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.fayaz.otgmaster.RUN_FD_SPIKE" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          On-device benchmark trigger, for phones with no working adb over wifi.
+          Its own launcher entry because it cannot be reached otherwise there.
+        -->
+        <activity
+            android:name=".bench.BenchLauncherActivity"
+            android:label="OTG Bench"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

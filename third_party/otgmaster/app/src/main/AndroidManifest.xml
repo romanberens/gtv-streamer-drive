@@ -1,0 +1,101 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Private bridge used by the TV file browser. Both APKs must share a signer. -->
+    <permission
+        android:name="pl.local.nasbrowser.permission.NTFS_PROVIDER"
+        android:protectionLevel="signature" />
+
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="true" />
+
+    <!-- MountedDriveService: keeps the process out of the cached-app freezer while a drive
+         is mounted, so other apps can keep reading its files. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Only so that notification shows in the shade on Android 13+; asked once, at the first mount. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Companion apps (Backup Master) that want mount events; see ExtensionContract. -->
+    <queries>
+        <intent>
+            <action android:name="app.fayaz.otgmaster.action.VOLUME_MOUNTED" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="false">
+        <!-- configChanges: rotating or resizing (a tablet, split screen) re-lays the Compose UI
+             out in place instead of recreating the activity, which threw away whatever screen
+             was open — a half-filled Format or Encrypt form went back to the main screen.
+             The layout reads its window size from BoxWithConstraints, so it still adapts. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+
+            <!-- Share target: ACTION_SEND must be on the real activity (not an alias) so
+                 Android 11+ can validate it against the <share-target> in shortcuts.xml,
+                 allowing individual drive names to appear as direct-share shortcuts. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <activity
+            android:name=".feedback.FeedbackActivity"
+            android:label="@string/feedback_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <service
+            android:name=".MountedDriveService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <provider
+            android:name=".provider.VeraCryptDocumentProvider"
+            android:authorities="app.fayaz.otgmaster.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <provider
+            android:name=".provider.TvBridgeProvider"
+            android:authorities="app.fayaz.otgmaster.tvbridge"
+            android:exported="true"
+            android:permission="pl.local.nasbrowser.permission.NTFS_PROVIDER" />
+
+        <!-- "Proceed" / "Not now" on a backup's low-space question. -->
+        <receiver
+            android:name=".backup.BackupActionReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

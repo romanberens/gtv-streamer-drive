@@ -1,0 +1,13 @@
+--- a/src/main/java/me/jahnen/libaums/core/driver/scsi/ScsiBlockDevice.kt
++++ b/src/main/java/me/jahnen/libaums/core/driver/scsi/ScsiBlockDevice.kt
+@@ -229,8 +229,8 @@
+ 
+     @Throws(IOException::class)
+     private fun requestSense() {
+-        val inBuffer = ByteBuffer.allocate(18)
+-        val sense = ScsiRequestSense(inBuffer.array().size.toByte(), lun = lun)
++        val inBuffer = ByteBuffer.allocate(252)
++        val sense = ScsiRequestSense(inBuffer.array().size, lun = lun)
+         when (val status = transferOneCommand(sense, inBuffer)) {
+             CommandStatusWrapper.COMMAND_PASSED -> {
+                 inBuffer.clear()

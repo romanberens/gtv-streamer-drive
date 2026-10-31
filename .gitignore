@@ -1,0 +1,24 @@
+.gradle/
+.gradle-local/
+build/
+*/build/
+local.properties
+*.apk
+*.ap_
+*.idsig
+
+# Recon artifacts captured from the Chromecast.
+dumpsys_*.txt
+features.txt
+packages_f.txt
+permissions_dangerous.txt
+services.txt
+settings_*.txt
+recon_screenshot.png
+recon_screenrecord.mp4
+codec_xml/
+adb_recon_test/
+.kotlin/
+artifacts/
+hs_err_pid*.log
+third_party/otgmaster/.git.otgmaster-backup/

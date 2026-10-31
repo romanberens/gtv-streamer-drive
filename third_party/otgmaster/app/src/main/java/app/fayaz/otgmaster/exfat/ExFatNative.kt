@@ -1,0 +1,146 @@
+package app.fayaz.otgmaster.exfat
+
+import app.fayaz.otgmaster.block.RawBlockDevice
+import java.nio.ByteBuffer
+
+object ExFatNative {
+
+    init {
+        // Host unit tests load a desktop build of the same sources instead.
+        val hostLib = System.getProperty("otg.native.hostlib")
+        if (hostLib != null) System.load(hostLib) else System.loadLibrary("veracrypt-native")
+    }
+
+    /**
+     * Mounts the exFAT filesystem.
+     * @param blockDevice The Kotlin BlockDevice to read from.
+     * @return A pointer to the native `struct exfat` or 0 if failed.
+     */
+    /** @param readOnly mount with libexfat's `ro` option: no write reaches the device, including the volume-dirty flag. */
+    external fun mount(blockDevice: RawBlockDevice, readOnly: Boolean): Long
+
+    /**
+     * Unmounts the exFAT filesystem and frees memory.
+     */
+    external fun unmount(exfatPtr: Long)
+
+    /** libexfat's errors and warnings since the last call, one per line; null if none (E3). */
+    external fun takeMessages(): String?
+
+    /**
+     * Puts what libexfat said since the last call into the app's log, so a "Report issue"
+     * carries it. Before this a read-write mount refused by libexfat reached the user as
+     * "Failed to mount exFAT: null" (#98), its reason left in logcat.
+     */
+    fun reportMessages(context: String, errorsOnly: Boolean = false, max: Int = MAX_LINES): Int {
+        val text = try { takeMessages() } catch (_: UnsatisfiedLinkError) { null } ?: return 0
+        // In use, libexfat warns about reference counts on routine closes; only errors
+        // are worth a line there. At mount every warning counts (an unclean volume).
+        val lines = text.lineSequence().filter { it.isNotBlank() && (!errorsOnly || it.startsWith("ERROR")) }
+            .take(max).toList()
+        for (line in lines) app.fayaz.otgmaster.OtgMasterState.log("exFAT ($context): $line")
+        return lines.size
+    }
+
+    private const val MAX_LINES = 12
+
+    @JvmStatic
+    external fun getFreeSpace(exfatPtr: Long): Long
+
+    /** The volume label, or "" if the volume has none. */
+    @JvmStatic
+    external fun getLabel(exfatPtr: Long): String
+
+    @JvmStatic
+    external fun getRootNode(exfatPtr: Long): ExFatNode?
+
+    @JvmStatic
+    external fun readDir(exfatPtr: Long, nodePtr: Long): Array<ExFatNode>?
+
+    @JvmStatic
+    /** Reads into [buffer] starting at [bufferOffset], avoiding an intermediate copy. */
+    external fun readFile(
+        exfatPtr: Long, nodePtr: Long, offset: Long, size: Int,
+        buffer: ByteArray, bufferOffset: Int,
+    ): Int
+
+    @JvmStatic
+    external fun writeFile(exfatPtr: Long, nodePtr: Long, offset: Long, size: Int, buffer: ByteArray): Int
+
+    @JvmStatic
+    external fun setLength(exfatPtr: Long, nodePtr: Long, length: Long): Int
+
+    @JvmStatic
+    external fun createFile(exfatPtr: Long, path: String): Int
+
+    @JvmStatic
+    external fun createDirectory(exfatPtr: Long, path: String): Int
+
+    @JvmStatic
+    external fun deleteNode(exfatPtr: Long, nodePtr: Long): Int
+
+    @JvmStatic
+    external fun rename(exfatPtr: Long, oldPath: String, newPath: String): Int
+
+    @JvmStatic
+    external fun flush(exfatPtr: Long): Int
+
+    @JvmStatic
+    external fun putNode(exfatPtr: Long, nodePtr: Long)
+
+    // These functions will be called FROM C via JNI to read/write the block device.
+    
+    @JvmStatic
+    fun pread(blockDevice: RawBlockDevice, offset: Long, size: Int, destBuffer: ByteArray): Int {
+        return try {
+            val blockSize = blockDevice.blockSize
+            val startBlock = offset / blockSize
+            val endBlock = (offset + size - 1) / blockSize
+            val numBlocks = (endBlock - startBlock + 1).toInt()
+            
+            // Read the required blocks
+            val blocksData = blockDevice.readBlocks(startBlock, numBlocks)
+            
+            // Copy the requested byte range into destBuffer
+            val blockOffset = (offset % blockSize).toInt()
+            System.arraycopy(blocksData, blockOffset, destBuffer, 0, size)
+            size
+        } catch (e: Exception) {
+            e.printStackTrace()
+            app.fayaz.otgmaster.OtgMasterState.logFailure("exfat-io", "exFAT: reading $size bytes at byte $offset failed", e)
+            -1
+        }
+    }
+
+    @JvmStatic
+    fun pwrite(blockDevice: RawBlockDevice, offset: Long, size: Int, srcBuffer: ByteArray): Int {
+        return try {
+            val blockSize = blockDevice.blockSize
+            val startBlock = offset / blockSize
+            val endBlock = (offset + size - 1) / blockSize
+            val numBlocks = (endBlock - startBlock + 1).toInt()
+            
+            val blockOffset = (offset % blockSize).toInt()
+            
+            if (blockOffset == 0 && size % blockSize == 0) {
+                // Perfectly block aligned write
+                blockDevice.writeBlocks(startBlock, srcBuffer)
+            } else {
+                // Read-modify-write for unaligned writes
+                val blocksData = blockDevice.readBlocks(startBlock, numBlocks)
+                System.arraycopy(srcBuffer, 0, blocksData, blockOffset, size)
+                blockDevice.writeBlocks(startBlock, blocksData)
+            }
+            size
+        } catch (e: Exception) {
+            app.fayaz.otgmaster.OtgMasterState.logFailure("exfat-io", "exFAT: writing $size bytes at byte $offset failed", e)
+            e.printStackTrace()
+            -1
+        }
+    }
+    
+    @JvmStatic
+    fun getDeviceSize(blockDevice: RawBlockDevice): Long {
+        return blockDevice.blockCount * blockDevice.blockSize
+    }
+}

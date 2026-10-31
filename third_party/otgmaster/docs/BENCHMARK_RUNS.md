@@ -1,0 +1,3299 @@
+# Benchmark run log
+
+Append-only. One row per run, newest first. Required by `AGENTS.md` — a run that
+exists only in logcat and on the drive did not happen as far as the repo is
+concerned.
+
+This file is the raw record. `BENCHMARK_RESULTS.md` holds the curated reference
+figures and the rules for comparing them; every figure there should be traceable
+to a row here.
+
+## How to read a row
+
+- **Sections** is what `--es tests` actually named. Omitting it runs the read-only
+  sections only and skips the five write sections **silently**, so a row that does
+  not say what ran proves nothing about the write path.
+- **`PARTIAL` / `NOT VERIFIED`** are recorded as themselves. They mean the suite
+  declined to claim a verdict it could not support — most often because no remount
+  was performed. They are never rounded up to a pass.
+- **`e2fsck`** is the host-side check after the run, on the mapped/decrypted device.
+  Hash-clean is not fsck-clean. `n/a` means the filesystem is not ext4.
+- **Every completed run is here.** A run that did not complete — dead drive, dead USB
+  handle, crash, interruption — produced no result and is not logged. A run that
+  completed is logged whatever it says, including `FAILED` sections, `PARTIAL`
+  verdicts and `*** CONTAMINATED ***` flags. If a row looks bad, that is the point.
+- Figures from different devices, different sessions, or with a differing
+  block-layer control are **not** comparable. See `BENCHMARK_RESULTS.md`.
+- **Commit** is the tree the APK was actually built from. The report stamps itself
+  from `git describe` at build time, so a `-dirty` label names a commit the APK is
+  *not* — it carries uncommitted work the label does not mention. Commit before
+  building. Where a run below was made from a dirty tree, the row says what the APK
+  really contained and gives its sha256, because the label alone would send a reader
+  to the wrong diff.
+
+---
+
+## 2026-10-30 — another phone over MTP (M30 with the realme attached)
+
+Galaxy M30 (Android 10), the 0.5.0 build `b3b79f8`, then `a9fc0a2`, with a realme 8 (RMX3085, Android 13)
+attached by OTG cable, unlocked, in File transfer mode. Its one USB interface is class 6/1/1 ("MTP").
+
+- `f3c52d4` asked for permission and then handed the device to the mass-storage opener, which found no
+  interface and logged only "Could not open RawBlockDevice via libaums." Fixed in `b3b79f8`: an MTP device goes
+  to the MTP path after the grant, and every device the opener skips or fails is logged with its reason.
+- `b3b79f8`: "Mounted realme RMX3085 over MTP, read-only: Internal shared storage", 108.2 GB with used and
+  free space as the realme reports them. The Files app listed the storage's folders and DCIM/Camera through
+  OTG Master's provider, and a 3.54 MB photo opened in full, which reads the whole file with
+  GetPartialObject64. No error in the app's log.
+- `a9fc0a2`: the card offers Open Files App only.
+
+---
+
+## 2026-10-30 — first device backups: restic repository written by the app, checked by restic
+
+Galaxy M30 (Android 10), Drive 5 (…EF449), the debug build `cf31657`/`546f4a2` of `feat/restic`, driven by
+the debug `RUN_BACKUP` broadcast (bench/BackupTestReceiver). Source: `BENCH/edge` on the plain exFAT partition
+ENC2EXFAT (22 fixture files, 67.2 MiB, including a 64 MiB file of zeros). Destination: the folder `restic-test`
+on the plain FAT32 partition FMT_FAT32, through the app's own DocumentsProvider.
+
+| Step | Result |
+|---|---|
+| First backup | SUCCESS: 22 files, 3.7 MB added (the zeros deduplicate), snapshot `43e6de35` |
+| Second backup, nothing changed | SUCCESS: 22 files, 16.6 KB added (tree blobs only; the parent snapshot let every file be skipped unread) |
+| Check, reading all data | Repository OK: 2 snapshots, 22 data blobs read and verified |
+| Restore of the newest snapshot to `restic-test-restored` on the same partition | SUCCESS: 22 files, 67.2 MB |
+
+On the laptop, the repository folder and the restored folder were copied off the drive by the debug export (a
+whole-partition dump over Wi-Fi adb ran at 0.4 MB/s and was abandoned) and checked with restic 0.18.1:
+`snapshots` lists both, with the job's tags and path `/edge`; `check --read-data` finds no errors; `restore latest`
+gives the same 22 files, byte for byte, as the app's own restore. Host fsck of FMT_FAT32 is pending with Drive 5's
+next read-back.
+## 2026-10-30 — the USB pipelining A/B, the write lost after a reset, and the write-replay fix (V25)
+
+OnePlus 7 (Android 16), Drive 2, `start_run.sh` with the matrix credentials, one partition per run. Each report's
+`build:` line was checked against the APK installed before the run. Builds:
+
+- **`e68f230`** (`perf/usb-pipeline`, not merged): `PrefetchingBlockDevice`, a read-ahead that overlaps the next USB
+  read with the app's work, switched by the `pipeline` bench extra (off/on), plus the V24 phase timers.
+- **`066daaf`, `92d3b6e`** (`fix/write-replay`): the replay of the last 1 MiB written after any reset (V25);
+  `92d3b6e` reuses the window's buffers instead of allocating one per write.
+- **`6bd4eb1`**: the control for the A/B, the published `test-usbfix-6bd4eb1` (#93 + #96's first commit).
+
+"Failed attempts" counts libaums' `Could not read/write` lines in the run's logcat.
+
+| Partition | Build | Sections | seq read 128 KiB (MB/s) | bigwrite write / read-back (MB/s) | Verdict | Failed attempts | Host check |
+|---|---|---|---|---|---|---|---|
+| D2VCEXFAT | `e68f230`, pipeline off | seq, bigwrite | 24.73 | 7.55 / 22.62 | ALL PASSED | 18 | ALL CLEAN except this partition's big.bin, from run 4 below (09:22) |
+| D2VCEXFAT | `e68f230`, pipeline on | seq, bigwrite | 25.93 | 7.56 / 20.50 | ALL PASSED | 19 | as above |
+| D2VCEXFAT | `e68f230`, pipeline off | seq, bigwrite | 22.65 | 7.58 / 22.64 | ALL PASSED | 18 | as above |
+| D2VCEXFAT | `e68f230`, pipeline on | seq, bigwrite | 29.12 | 6.95 / — | **FAILED: big.bin DIFFERS at byte 44,732,416** | 43 | **D2VCEXFAT FAILED**: big.bin wrong in one sector (fsck clean); the other 9 partitions CLEAN |
+| D2VCFAT32 | `066daaf` | bigwrite | — | 4.41 / 11.19 | ALL PASSED | 0 | Drive 2 CLEAN (17:20 read-back) |
+| D2VCEXFAT | `066daaf` | bigwrite | — | 4.15 / 10.49 | ALL PASSED | 0 | Drive 2 CLEAN |
+| D2VCFAT32 | `066daaf` | write, correct, fixtures, bigwrite | — | 4.53 / 11.26 | ALL PASSED | 0 | Drive 2 CLEAN |
+| D2VCEXFAT | `6bd4eb1` (A/B control) | bigwrite | — | 4.22 / 10.58 | ALL PASSED | 0 | Drive 2 CLEAN |
+| D2VCEXFAT | `92d3b6e` (A/B fix) | bigwrite | — | 4.35 / 10.95 | ALL PASSED | 0 | Drive 2 CLEAN |
+| D2VCEXFAT | `6bd4eb1` (A/B control) | bigwrite | — | 4.42 / 10.59 | ALL PASSED | 0 | Drive 2 CLEAN |
+| D2VCEXFAT | `92d3b6e` (A/B fix) | bigwrite | — | 4.34 / 10.53 | ALL PASSED | 0 | Drive 2 CLEAN |
+
+**Pipelining: not merged.** Sequential reads rose 5–20% with the prefetch on (25.93 and 29.12 against 24.73 and
+22.65), inconsistently, and the bigwrite read-back fell about 9%. The phase timers put USB gaps at 71.4% of read wall
+time with it and 71.5% without, so it overlapped almost nothing. A second reader of the device is a concurrency risk
+for a gain that small, and correctness comes first. The next speed lead is the app's per-chunk CPU cost, about 1.9 ms
+per 64 KiB.
+
+**Run 4's mismatch is a drive losing an acknowledged write after a reset, and it is not new.** The host read-back
+(`d2-verify-pipe`, 09:22) found `BENCH_BIG/big.bin` wrong in exactly one 512-byte sector at file offset 44,732,416;
+fsck clean, every neighbouring sector identical to that morning's copy. That sector, LBA 17,607,920, was all zeros on
+the drive. At 08:52:12 a 64 KiB write at block 17,607,921 failed, and libaums sent its Bulk-Only reset six times before
+the app's recovery retried it. Block 17,607,920 was written and confirmed by the command before; it starts the 4 KiB
+unit holding the failed write's first seven blocks, and the drive lost the whole unit. The retry rewrote the failed
+write's blocks, and nothing rewrote the one before. The prefetch only reads, and the sector matches no data the app
+produced. 0.4.2 retries the same way. The fix (`066daaf`, V25) writes the last 1 MiB again after any reset;
+`WriteReplayTest` reproduces the loss and fails 4 of 5 cases without it.
+
+**The fix costs no speed.** The four A/B runs alternate builds on the same partition: 4.22 and 4.42 MB/s without it,
+4.35 and 4.34 with it; read-back 10.58/10.59 against 10.95/10.53. No reset happened in them, so no replay ran. That
+day the phone wrote at about 4.3 MB/s on every build, against 7.5 that morning, and read back at half speed too, so
+the drop is the phone or its link: the control build was as slow.
+
+Laptop, 10-30 17:20 (`d2-verify-1030b`), after every run above and the `7148f3c` check: all 10 partitions checker
+clean, every file matched, every bigwrite file and tree intact, D2VCEXFAT's big.bin included (a later run
+rewrote it). The verifier marks D2VCEXFAT not clean for one reason only: `BENCH/file with spaces.txt`, below.
+
+The run-4 sector stays damaged until a run rewrites big.bin; the later runs on D2VCEXFAT did. D2VCEXFAT also has the
+file `BENCH/file with spaces.txt`, copied there in the `6bd4eb1` smoke test, which the verifier reports as unexplained.
+
+### Commit hashes after the merge of #93
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `ea69d7b` | `be05e84` | #93 | fix: a drive the USB transfer leaves stuck is reset, not retried into (#88, #71) |
+| `9978050` | `3f095ee` | #93 | fix(usb): retry at the same size after a port reset; every recovery step in the app's log |
+| `4b05bad` | `0251b00` | #93 | fix(usb): any failure is retried once at the same size before the size is blamed |
+| `36c0065` | `4bf80c2` | #93 | fix(usb): keep a lowered transfer size only when the drive needed a port reset |
+| `4eae31e` | `4712685` | #93 | docs: record the #93/#96 device runs and the V22 phase timers; hash table for #82 |
+
+### Commit hashes after the merge of #96
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `d055cb1` (`6bd4eb1` before the rebase onto `main`) | `e4afba6` | #96 | fix(usb): drives over 2 TiB open and are addressed with 16-byte SCSI commands (#87) |
+| `2beb34e` | `1bb18aa` | #96 | fix(usb): ask READ CAPACITY(10) again before believing 0xFFFFFFFF (#87) |
+| `7148f3c` | `069d7a6` | #96 | fix(log): a mount that fails says why: libexfat's messages and swallowed exceptions (#98) |
+| `573aea6` | `0ce2fb6` | #96 | docs: record Drive 5 on 6bd4eb1 (M30, realme) and the 7148f3c device checks |
+
+### Commit hashes after the merge of #99
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `69cafee` (`066daaf` before the rebase onto `main`) | `1a9f5ec` | #99 | fix(usb): write the last 1 MiB again after any reset, so a drive cannot silently drop acknowledged writes (libaums V25) |
+| `4864b3d` (`92d3b6e`) | `5d562a5` | #99 | perf(usb): reuse the replay window's buffers instead of allocating one per write |
+| `1e09561` | `1bc28dd` | #99 | docs: record the pipelining A/B, the lost-write root cause and the write-replay A/B; hash table for #93 |
+
+### Commit hashes after the merge of #100
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `f7a9dce` | `bb58b42` | #100 | test(e2e): click the disconnect history again when the click expanded nothing |
+| `18d7a2e` | `d9696ce` | #100 | feat(log): say why each partition a scan found was neither mounted nor offered |
+| `d783722` | `c38a7db` | #100 | feat(report): USB lines that scrolled out of the log still reach Report issue |
+| `d9d8c73` | `6e2d7c2` | #100 | feat(encrypt): the new volume is unlocked with its password before it is used, not mounted with the key in memory |
+| `cf2f7c4` | `3369cf4` | #100 | feat: Format and Encrypt run in the foreground, with progress and a result in notifications |
+| `8f47095` | `6863756` | #100 | ui: the More actions list takes its button's colours and text size |
+| `1bf7a4e` | `8db87b2` | #100 | feat(log): 200 time-stamped lines with repeats folded, every failure's reason, and all of it in Report issue |
+| `97ffd5e` | `584d5c4` | #100 | docs: hash table for #99; changelog for everything since v0.4.2 on this branch |
+
+---
+
+## 2026-10-22, 10-29 and 10-30 — USB recovery for #88/#71 and the 2 TB fix for #87 (#93, #96), and the V22 phase timers
+
+Each run used `regress_chain.sh` (Drives 2 and 3) or `sequence_runs.sh` (Drive 5) → `start_run.sh` with the "full"
+section set and the matrix credentials. Each report's `build:` line was checked against the APK installed
+before the run. Builds:
+
+- **`31acb7f`:** #93 and #96 before #93's last commit. It has the reset, probe, quirks and same-size retry, but a
+  lowered size was still remembered without a port reset.
+- **`6275ed9`, `6bd4eb1`:** all of #93 and #96. They differ only in versionName ("0.4.3" vs "0.4.2") and
+  AGENTS.md text: `git diff --stat 6275ed9 6bd4eb1` touches nothing else. Rebased onto `main`, the
+  code is the same, as #96's commit on top of this one. `6bd4eb1` is the build published as the `test-usbfix-6bd4eb1` pre-release.
+
+"Failed attempts" counts libaums' `Could not read/write` retries in the run's logcat. Each was recovered,
+because every run below completed all its sections.
+
+| Device | Partition | Build | Sections | bigwrite write / read-back (MB/s) | Fixtures | Failed attempts, recovery | Host check |
+|---|---|---|---|---|---|---|---|
+| OnePlus 7 (Android 16) | D2VCFAT32 | `31acb7f` | full, all ✓ | 6.33 / 24.33 | ALL 20958 MATCHED | 16; one read failed twice at 120 KiB → 60 KiB **and remembered** (the bug `4b05bad`/`36c0065` fix) | Drive 2 ALL CLEAN |
+| OnePlus 7 | D2VCFAT32 | `6275ed9` | full, all ✓ | 7.44 / 24.31 | ALL 20958 MATCHED | 16; one write failed twice at 120 KiB → 60 KiB for the session, not remembered | Drive 2 ALL CLEAN |
+| OnePlus 7 | D2L1EXT4 | `6275ed9` | full, all ✓ | 5.22 / 22.53 | ALL 21024 MATCHED | 23; two same-size retries, one → 60 KiB | Drive 2 ALL CLEAN (e2fsck clean) |
+| OnePlus 7 | D2VCFAT32 | 0.4.2 `6e281db` (A/B) | full, all ✓ | 7.77 / 25.14 | ALL 20958 MATCHED | 12; 1 step-down (0.4.2's bare step-down) | Drive 2 ALL CLEAN |
+| Samsung M30 (Android 10) | D3L1EXFAT | `6275ed9` | full, all ✓ | 3.63 / 9.06 | ALL 20929 MATCHED | 0 | Drive 3 ALL CLEAN |
+| Samsung M30 | D3L4EXFAT | `6275ed9` | full, all ✓ | 2.49 / 9.18 | ALL 20910 MATCHED | 0 | Drive 3 ALL CLEAN |
+| Samsung M30 | D5 p1 VC_ATS_ARGON_PIM0 (…EF449) | `6bd4eb1` | full, all ✓ | 1.94 / 2.59 | ALL 20902 MATCHED | 0 | EF449 CLEAN (10-30) |
+| Samsung M30 | D5 p2 VC_STA_ARGON_PIM1 (…EF449) | `6bd4eb1` | full, all ✓ | 1.37 / 2.82 | ALL 20965 MATCHED | 0 | EF449 CLEAN (10-30) |
+| Samsung M30 | D5 p3 VC_TWO_SHA512_PIM0 (…EF449) | `6bd4eb1` | full, all ✓ | 2.01 / 8.82 | ALL 20962 MATCHED | 11; one 120 KiB write gave up, the drive answered, and the same-size retry went through | EF449 CLEAN (10-30) |
+| Samsung M30 | D5 p4 VC_AT_ARGON_PIM1 (…EF449) | `6bd4eb1` | full, all ✓ | 2.59 / 6.22 | ALL 20950 MATCHED | 0 | EF449 CLEAN (10-30) |
+| Samsung M30 | D5 p5 VC_SA_SHA512_PIM1 (…EF449) | `6bd4eb1` | full, all ✓ | 2.15 / 3.27 | ALL 20027 MATCHED | 0 | EF449 CLEAN (10-30) |
+| Samsung M30 | D5 p6 VC_TS_ARGON_PIM31 (…EF449) | `6bd4eb1` | full, all ✓ | 1.52 / 3.22 | ALL 20984 MATCHED | 0 | EF449 CLEAN (10-30) |
+| realme 8 (RMX3085, Android 13, Realme UI 4.0) | D5 p1 VC_ATS_ARGON_PIM0 (…EF455) | `6bd4eb1` | full, all ✓ | 2.58 / 3.65 | ALL 20902 MATCHED | 23; a 64 KiB read at block 100665344 (partition 7's start, auto-mounted) failed twice → 32 KiB for the session | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+| realme 8 | D5 p2 VC_STA_ARGON_PIM1 (…EF455) | `6bd4eb1` | full, all ✓ | 1.74 / 3.84 | ALL 20965 MATCHED | 36; a 120 KiB read and a 60 KiB write each failed twice and were stepped down for the session | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+| realme 8 | D5 p3 VC_TWO_SHA512_PIM0 (…EF455) | `6bd4eb1` | full, all ✓ | 1.78 / 7.92 | ALL 20962 MATCHED | 73; five writes (60 and 120 KiB) gave up, each recovered by a same-size retry after the drive answered | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+| realme 8 | D5 p4 VC_AT_ARGON_PIM1 (…EF455) | `6bd4eb1` | full, all ✓ | 2.63 / 7.55 | ALL 20950 MATCHED | 23; one 64 KiB write failed twice → stepped down; one read recovered at the same size | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+| realme 8 | D5 p5 VC_SA_SHA512_PIM1 (…EF455) | `6bd4eb1` | full, all ✓ | 2.48 / 4.36 | ALL 20915 MATCHED | 66; six writes (60–120 KiB) gave up, five recovered by a same-size retry | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+| realme 8 | D5 p6 VC_TS_ARGON_PIM31 (…EF455) | `6bd4eb1` | full, all ✓ | 2.04 / 4.43 | ALL 20984 MATCHED | 32; a 64 KiB read failed twice → 32 KiB; two reads recovered at the same size | EF455 CLEAN except FMT_FAT32 (an Android mount, below) |
+
+What these show:
+
+- **On the OnePlus, the retries come from the phone, not the change.** 0.4.2 retried 12 times on the same partition.
+  The PR build retries a similar number and recovers them the same way. Write speed is within run-to-run spread:
+  7.44 vs 7.77 MB/s.
+- **The M30 on Drive 3 and Drive 5 had no failed transfers at all.** On 0.4.2 it lost both Drive 3 exFAT partitions in
+  the bigwrite, and broke with USB read/write failures in every Drive 5 attempt (10-18 to 10-22, the section
+  below). One clean night doesn't prove those dropouts are gone, but they didn't happen.
+- **The realme run is the first on that phone to complete** (#71's OnePlus CPH2585 is an OPPO-family phone, like the realme). Its one stuck
+  read was recovered by a same-size retry and then a step-down, with no reset needed.
+- **No drive went dead on any of these runs, so `USBDEVFS_RESET` has still run only in unit tests.**
+
+Drive 5 finished on both phones on 10-30, every partition with all sections passing. The realme's runs recovered
+between 23 and 73 failed transfers each, many of them writes. The write-loss mechanism found on 10-30 (a Reset Recovery
+after a failed write can lose a 4 KiB unit the drive had already acknowledged, `fix/write-replay`) applies to those
+writes, and bigwrite and fixtures sample only part of the volume. So **the host checks of both Drive 5 sticks are the
+result that counts here**.
+
+Laptop, 10-30 20:00 (`hostcheck_d5.sh`, all 10 partitions of each stick): **EF449 (M30) is clean**, every checker
+clean and every fixture hash matching, the FAT32 partition the first device backups wrote to included. **EF455
+(realme) is clean on 9 of 10**, every fixture hash matching on all 10. Its FMT_FAT32 checker exits 1 for a dirty
+bit set in the primary boot sector only, FATs out of step and a free-cluster count one off, with a `LOST.DIR`
+created 10-29 23:01, when the stick went into the realme. That is Android's own storage service mounting a FAT32
+partition with the kernel's vfat (it creates `LOST.DIR`) and the stick leaving without an eject; OTG Master
+creates no `LOST.DIR` and writes no dirty bit. The data is intact. Metadata compares against the baselines show
+the changes the runs' writes explain.
+
+Laptop, 10-30: Drive 2 (all 10 partitions) and Drive 3 (all 10) read back with `read_matrix_drive.sh` and
+`verify_matrix_drive.py`. Both are **ALL CLEAN**: checker clean, every file matched, every bigwrite and tree intact.
+
+After the Drive 2 read-back, the published minified APK (`6bd4eb1`, R8) was smoke-tested on the OnePlus with
+Drive 2. D2VCFAT32 opened read-only (a read-only choice saved for that partition on this phone). D2VCEXFAT opened
+read-write. The Files app browsed `BENCH/edge`, opened `file with spaces.txt` ("Hello World", the manifest's hash),
+and copied it into `BENCH/`, where it read back. That copy is the one change Drive 2's next host check should
+report on D2VCEXFAT.
+
+**V22 phase timers, `feature/async-usbfs` `a52d526`, 10-22, OnePlus 7, bigwrite only:**
+
+| Partition | bigwrite write / read-back (MB/s) | Write: data / CSW wait / gaps, share of wall time | Result |
+|---|---|---|---|
+| D2VCFAT32 | 6.91 / 23.35 | 10.8% / 55.6% / 30.2% (33,202 commands, 65 KiB each) | ALL PASSED after remount |
+| D2VCEXFAT | 7.89 / 24.12 | 12.4% / 31.7% / 41.4% (19,509 commands, 110 KiB each) | ALL PASSED after remount |
+
+Data moves at 67 MB/s while the drive is taking it, and the drive's CSW wait is most of a write. So async URBs could
+save at most the CBW and data phases, ~2% of writes, and ~6% of reads, whose gaps are 74–75% of wall time. Overlapping
+the app's own work (cache, crypto, filesystem) with the transfer could save up to ~40%. Those numbers come from these
+two runs. Host check: Drive 2's 10-30 read-back above came after these runs and the #93 runs, and is ALL CLEAN.
+
+**`7148f3c` (#96's head: the READ CAPACITY(10) re-ask, V26, and the libexfat messages, E3), 10-30:**
+
+- OnePlus 7, D2VCEXFAT, sections `free,write,correct,fixtures`: the drive opened and all six Drive 2 partitions
+  mounted on the new init path. `write verify` ALL PASSED and `correctness` ALL PASSED. The 16 MiB write section ran
+  at 0.18 MB/s, the bottom of that section's 0.20–1.51 MB/s range on earlier runs, on a day this phone's bigwrite ran
+  at about half its usual speed on every build (the A/B in `fix/write-replay`). The phone left the network at 14:45
+  during `fixtures` (16,000 entries matched by then), so the run did not complete and has no row. No `exFAT (…)` line
+  appeared: a clean volume has nothing to report, and libexfat's routine reference-count warnings stay out of the
+  log while in use, as intended. Host check of D2VCEXFAT: pending, with Drive 2's next read-back.
+- Galaxy M30, Drive 5, the published minified APK (`test-diag-7148f3c`): the drive opened (`Initialized LUN 0:
+  blocks=121145344`) and its plain exFAT and FAT32 partitions auto-mounted read-write. The minified build has no
+  benchmark receiver, so this is a smoke test, not a run.
+
+Not completed, so no result: OnePlus D2VCFAT32 on `d133498` (stopped in the read sections, to rebuild with the
+same-size retry); the start of D2L1EXT4 on `31acb7f` (stopped to move to `6275ed9`).
+
+### Commit hashes after the merge of #82
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `d52add3` | `cae7d2b` | #82 | chore: bump version to 0.4.3 (49) |
+| `2cfa3a9` | `f615e4e` | #82 | docs: hash table for #81, the v0.4.2 records |
+| `19c13f8` | `01b1f3f` | #82 | chore: keep versionName 0.4.2 until the next tag; the rule checks versionCode |
+
+#93 and #96 were rebased from `19c13f8` onto `01b1f3f`. Those two commits have the same tree, so `d4fa8e2` → `36c0065`
+is the same code, and so is `6bd4eb1` → #96's rebased commit.
+
+---
+
+## 2026-10-18 (night) to 2026-10-22 — the 0.4.2 release matrix on `6e281db` (= `de98da6`)
+
+The matrix restarted on the final 0.4.2 tree once #74–#78 were in. Every report below says
+`build: 0.4.2 (48) commit 6e281db`, checked against the APK installed before each drive; `6e281db`
+is #78's head and landed on `main` as `de98da6` with an identical tree (hash table in the section
+below). Same procedure as the round below: one partition per run via `sequence_runs.sh` →
+`start_run.sh`, the "full" section set, password123 / PIM 1 / AES / SHA-512 unless the partition
+says otherwise (Drive 5 partitions carry their own cipher, KDF and PIM). After each drive's runs
+it went to the laptop: `read_matrix_drive.sh` + `verify_matrix_drive.py` (Drives 1–4), or
+`verify_volume.sh` + manifest hashes per partition (Drive 5, `hostcheck_d5.sh`).
+
+Devices: **Pixel 7 Pro** (Android 17, SDK 37), **OnePlus 7** (GM1901, LineageOS 23.2, Android 16),
+**Samsung M30** (SM-M305F, Android 10). Drive 5 exists twice: the original (…EF449) and a copy
+built from the same script (…EF455).
+
+| | Drive 1 | Drive 2 | Drive 3 | Drive 4 | Drive 5 |
+|---|---|---|---|---|---|
+| Pixel 7 Pro | 10/10 ✓ · host: D1FAT32 NOT CLEAN (vold, below) | 10/10 ✓ · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ (…EF455) · ALL CLEAN |
+| OnePlus 7 | 10/10 ✓ · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ (…EF449, p10 rerun) · ALL CLEAN |
+| Samsung M30 | 10/10 ✓ (D1EXT4 rerun) · ALL CLEAN | 10/10 ✓ · ALL CLEAN | 10/10 ✓ (two reruns) · ALL CLEAN | not run | **FAILED** — 2 partitions passed, then USB dropouts (below) |
+
+### Pixel 7 Pro · Drive 1 · 10-20 07:21 – 09:34
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D1FAT32 | 07:34 | 8.17 / 35.75 | ALL 20995 MATCHED | all ✓ |
+| D1EXFAT | 07:45 | 9.38 / 38.46 | ALL 20963 MATCHED | all ✓ |
+| D1NTFS | 08:05 | 3.16 / 35.27 | ALL 21052 MATCHED | all ✓ |
+| D1EXT4 | 08:18 | 6.17 / 41.87 | ALL 20854 MATCHED | all ✓ |
+| D1BLEXFAT | 08:32 | 6.61 / 27.22 | ALL 20898 MATCHED | all ✓ |
+| D1BLNTFS | 08:55 | 2.81 / 27.99 | ALL 20905 MATCHED | all ✓ |
+| D1APFSCI | 09:05 | — | ALL 22129 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSCS | 09:14 | — | ALL 22024 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECI | 09:24 | — | ALL 21777 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECS | 09:34 | — | ALL 21911 MATCHED | read sections ✓; writes SKIPPED (ro) |
+Laptop: 9 of 10 CLEAN. **D1FAT32 NOT CLEAN**: dirty bit set, boot sector and backup differ at
+offset 65 (01/00 — the volume-dirty flag), free-cluster summary off by one (83612 vs 83611).
+Every fixture and the big write matched. The Pixel's vold mounts a plain FAT32 partition with the
+kernel's own vfat driver as soon as the drive is attached, which sets that flag; the drive was
+pulled with vold's mount still up. The app's own writes go through its own driver, and the same
+partition was clean after the OnePlus and M30 runs. Repaired with `fsck.fat -a` (the user), clean.
+
+### Pixel 7 Pro · Drive 2 · 10-19 07:19 – 10:35
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D2VCFAT32 | 07:35 | 6.72 / 25.32 | ALL 20958 MATCHED | all ✓ |
+| D2VCEXFAT | 07:53 | 7.32 / 26.74 | ALL 20974 MATCHED | all ✓ |
+| D2VCNTFS | 08:21 | 2.76 / 26.33 | ALL 20919 MATCHED | all ✓ |
+| D2VCEXT4 | 08:39 | 5.46 / 28.56 | ALL 21071 MATCHED | all ✓ |
+| D2L1FAT32 | 08:55 | 7.05 / 27.62 | ALL 20953 MATCHED | all ✓ |
+| D2L1EXT4 | 09:14 | 5.28 / 28.01 | ALL 21024 MATCHED | all ✓ |
+| D2L2EXFAT | 09:32 | 7.47 / 26.29 | ALL 20942 MATCHED | all ✓ |
+| D2L4EXT4 | 09:51 | 5.08 / 29.13 | ALL 20888 MATCHED | all ✓ |
+| D2L4NTFS | 10:18 | 2.72 / 27.55 | ALL 20927 MATCHED | all ✓ |
+| D2BLFAT32 | 10:35 | 5.88 / 28.93 | ALL 20974 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### Pixel 7 Pro · Drive 3 · 10-19 19:16 – 22:33
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D3EXT2 | 19:21 | — | ALL 21821 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3EXT3 | 19:25 | — | ALL 21883 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3L1EXFAT | 19:44 | 7.47 / 26.14 | ALL 20929 MATCHED | all ✓ |
+| D3L1NTFS | 20:11 | 2.83 / 26.90 | ALL 20920 MATCHED | all ✓ |
+| D3L2FAT32 | 20:29 | 7.00 / 28.68 | ALL 20913 MATCHED | all ✓ |
+| D3L2NTFS | 20:59 | 2.62 / 25.62 | ALL 20925 MATCHED | all ✓ |
+| D3L2EXT4 | 21:18 | 5.17 / 26.62 | ALL 20939 MATCHED | all ✓ |
+| D3L4FAT32 | 21:40 | 4.32 / 28.76 | ALL 20972 MATCHED | all ✓ |
+| D3L4EXFAT | 22:05 | 4.36 / 27.05 | ALL 20910 MATCHED | all ✓ |
+| D3BLNTFS | 22:33 | 2.72 / 27.48 | ALL 21023 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### Pixel 7 Pro · Drive 4 · 10-19 17:43 – 19:00
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D4L1EXT2 | 17:48 | — | ALL 21870 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L1EXT3 | 17:53 | — | ALL 21875 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L2EXT2 | 17:58 | — | ALL 21678 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L2EXT3 | 18:03 | — | ALL 21971 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L4EXT2 | 18:08 | — | ALL 21916 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L4EXT3 | 18:13 | — | ALL 21846 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4VCEXT2 | 18:18 | — | ALL 21948 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4VCEXT3 | 18:23 | — | ALL 21956 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4BLFAT32 | 18:41 | 6.26 / 26.52 | ALL 20918 MATCHED | all ✓ |
+| D4BLEXFAT | 19:00 | 7.40 / 25.96 | ALL 21073 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### Pixel 7 Pro · Drive 5 (copy, …EF455) · 10-18 21:16 – 10-19 01:39
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| VC_ATS_ARGON_PIM0 | 21:58 | 3.82 / 5.86 | ALL 20902 MATCHED | all ✓ |
+| VC_STA_ARGON_PIM1 | 22:31 | 3.08 / 6.82 | ALL 20965 MATCHED | all ✓ |
+| VC_TWO_SHA512_PIM0 | 23:07 | 2.62 / 20.88 | ALL 20962 MATCHED | all ✓ |
+| VC_AT_ARGON_PIM1 | 23:26 | 4.76 / 17.11 | ALL 20950 MATCHED | all ✓ |
+| VC_SA_SHA512_PIM1 | 23:51 | 4.27 / 7.20 | ALL 20915 MATCHED | all ✓ |
+| VC_TS_ARGON_PIM31 | 01:23 | 3.38 / 7.65 | ALL 20984 MATCHED | all ✓ |
+| FMT_EXFAT | 01:28 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| FMT_FAT32 | 01:32 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| ENC_TO_EXFAT | 01:35 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| ENC_TO_FAT32 | 01:39 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+FMT_* and ENC_TO_* are the Format/Encrypt targets: the app formats or encrypts them as the run's
+first step, so they run the read sections and fixtures only. Laptop (`hostcheck-042g-EF455`):
+all ten partitions CLEAN.
+
+### OnePlus 7 · Drive 1 · 10-19 17:43 – 20:27
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D1FAT32 | 17:57 | 8.19 / 15.96 | ALL 20995 MATCHED | all ✓ |
+| D1EXFAT | 18:12 | 8.87 / 18.15 | ALL 20963 MATCHED | all ✓ |
+| D1NTFS | 18:34 | 3.03 / 26.65 | ALL 21052 MATCHED | all ✓ |
+| D1EXT4 | 18:49 | 6.36 / 18.89 | ALL 20854 MATCHED | all ✓ |
+| D1BLEXFAT | 19:08 | 5.74 / 12.92 | ALL 20898 MATCHED | all ✓ |
+| D1BLNTFS | 19:34 | 2.76 / 17.52 | ALL 20905 MATCHED | all ✓ |
+| D1APFSCI | 19:46 | — | ALL 22129 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSCS | 19:58 | — | ALL 22024 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECI | 20:13 | — | ALL 21777 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECS | 20:27 | — | ALL 21911 MATCHED | read sections ✓; writes SKIPPED (ro) |
+Laptop: ALL CLEAN.
+
+### OnePlus 7 · Drive 2 · 10-19 21:03 – 10-20 01:05
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D2VCFAT32 | 21:24 | 6.57 / 13.46 | ALL 20958 MATCHED | all ✓ |
+| D2VCEXFAT | 21:48 | 6.21 / 12.90 | ALL 20974 MATCHED | all ✓ |
+| D2VCNTFS | 22:19 | 2.80 / 16.91 | ALL 20919 MATCHED | all ✓ |
+| D2VCEXT4 | 22:42 | 5.63 / 13.08 | ALL 21071 MATCHED | all ✓ |
+| D2L1FAT32 | 23:03 | 6.65 / 14.14 | ALL 20953 MATCHED | all ✓ |
+| D2L1EXT4 | 23:26 | 5.42 / 13.11 | ALL 21024 MATCHED | all ✓ |
+| D2L2EXFAT | 23:50 | 6.30 / 12.84 | ALL 20942 MATCHED | all ✓ |
+| D2L4EXT4 | 00:14 | 5.24 / 13.17 | ALL 20888 MATCHED | all ✓ |
+| D2L4NTFS | 00:44 | 2.80 / 16.88 | ALL 20927 MATCHED | all ✓ |
+| D2BLFAT32 | 01:05 | 6.70 / 14.83 | ALL 20974 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### OnePlus 7 · Drive 3 · 10-19 07:19 – 11:15
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D3EXT2 | 07:27 | — | ALL 21821 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3EXT3 | 07:34 | — | ALL 21883 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3L1EXFAT | 07:59 | 6.29 / 12.88 | ALL 20929 MATCHED | all ✓ |
+| D3L1NTFS | 08:30 | 2.85 / 16.94 | ALL 20920 MATCHED | all ✓ |
+| D3L2FAT32 | 08:52 | 6.80 / 14.05 | ALL 20913 MATCHED | all ✓ |
+| D3L2NTFS | 09:24 | 2.81 / 16.54 | ALL 20925 MATCHED | all ✓ |
+| D3L2EXT4 | 09:48 | 5.46 / 13.06 | ALL 20939 MATCHED | all ✓ |
+| D3L4FAT32 | 10:13 | 4.51 / 14.03 | ALL 20972 MATCHED | all ✓ |
+| D3L4EXFAT | 10:44 | 4.29 / 13.02 | ALL 20910 MATCHED | all ✓ |
+| D3BLNTFS | 11:15 | 2.75 / 17.51 | ALL 21023 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### OnePlus 7 · Drive 4 · 10-20 07:22 – 09:11
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D4L1EXT2 | 07:30 | — | ALL 21870 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L1EXT3 | 07:38 | — | ALL 21875 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L2EXT2 | 07:46 | — | ALL 21678 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L2EXT3 | 07:54 | — | ALL 21971 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L4EXT2 | 08:01 | — | ALL 21916 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4L4EXT3 | 08:09 | — | ALL 21846 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4VCEXT2 | 08:17 | — | ALL 21948 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4VCEXT3 | 08:25 | — | ALL 21956 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D4BLFAT32 | 08:47 | 6.15 / 14.09 | ALL 20918 MATCHED | all ✓ |
+| D4BLEXFAT | 09:11 | 6.61 / 13.58 | ALL 21073 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### OnePlus 7 · Drive 5 (original, …EF449) · 10-18 21:28 – 10-20 10:10
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| VC_ATS_ARGON_PIM0 | 22:41 | 3.53 / 5.70 | ALL 20027 MATCHED | all ✓ |
+| VC_STA_ARGON_PIM1 | 23:18 | 2.58 / 6.05 | ALL 20965 MATCHED | all ✓ |
+| VC_TWO_SHA512_PIM0 | 23:56 | 2.80 / 13.62 | ALL 20962 MATCHED | all ✓ |
+| VC_AT_ARGON_PIM1 | 00:20 | 3.71 / 10.30 | ALL 20950 MATCHED | all ✓ |
+| VC_SA_SHA512_PIM1 | 00:46 | 3.88 / 6.57 | ALL 20027 MATCHED | all ✓ |
+| VC_TS_ARGON_PIM31 | 02:21 | 2.99 / 6.74 | ALL 20984 MATCHED | all ✓ |
+| FMT_EXFAT | 02:27 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| FMT_FAT32 | 02:32 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| ENC_TO_EXFAT | 02:35 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+| ENC_TO_FAT32 | 02:37 | — | — | no result (nothing mounted; dropped) |
+| ENC_TO_FAT32 | 10:10 | — | ALL 20027 MATCHED | all ✓ (no bigwrite: Format/Encrypt target) |
+The first ENC_TO_FAT32 (02:37) mounted nothing — the phone had locked — and was rerun on 10-20.
+VC_ATS_ARGON_PIM0 and VC_SA_SHA512_PIM1 matched 20027 fixtures rather than the copy's 20902/20915:
+on this stick those two partitions held a 20027-file fixture set at the time (p5 still does; p1
+was rebuilt with 20902 on 10-22), and the app checks against the manifest on the partition. Laptop (`hostcheck-042g-EF449`, `hostcheck-042h-op-EF449` for p10):
+all ten CLEAN.
+
+### Samsung M30 · Drive 1 · 10-21 06:09 – 10:08
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D1FAT32 | 06:28 | 5.25 / 13.58 | ALL 20995 MATCHED | all ✓ |
+| D1EXFAT | 06:49 | 5.65 / 14.95 | ALL 20963 MATCHED | all ✓ |
+| D1NTFS | 07:19 | 2.25 / 18.98 | ALL 21052 MATCHED | all ✓ |
+| D1EXT4 | 07:26 | — | — | no result (nothing mounted; dropped) |
+| D1BLEXFAT | 07:56 | 3.51 / 8.88 | ALL 20898 MATCHED | all ✓ |
+| D1BLNTFS | 08:32 | 2.01 / 11.30 | ALL 20905 MATCHED | all ✓ |
+| D1APFSCI | 08:49 | — | ALL 22129 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSCS | 09:05 | — | ALL 22024 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECI | 09:26 | — | ALL 21777 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1APFSECS | 09:47 | — | ALL 21911 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D1EXT4 | 10:08 | 4.42 / 15.88 | ALL 20854 MATCHED | all ✓ |
+D1EXT4's first run mounted nothing: a burst of USB errors at unlock (75 retries); no result, rerun.
+Laptop: ALL CLEAN.
+
+### Samsung M30 · Drive 2 · 10-20 17:39 – 10-21 02:53
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D2VCFAT32 | 18:28 | 4.32 / 8.74 | ALL 20958 MATCHED | all ✓ |
+| D2VCEXFAT | 19:25 | 3.59 / 8.89 | ALL 20974 MATCHED | all ✓ |
+| D2VCNTFS | 20:30 | 1.91 / 10.57 | ALL 20919 MATCHED | all ✓ |
+| D2VCEXT4 | 21:24 | 3.35 / 9.48 | ALL 21071 MATCHED | all ✓ |
+| D2L1FAT32 | 22:16 | 4.32 / 9.34 | ALL 20953 MATCHED | all ✓ |
+| D2L1EXT4 | 23:10 | 3.28 / 9.49 | ALL 21024 MATCHED | all ✓ |
+| D2L2EXFAT | 00:06 | 3.58 / 8.99 | ALL 20942 MATCHED | all ✓ |
+| D2L4EXT4 | 01:00 | 3.24 / 9.57 | ALL 20888 MATCHED | all ✓ |
+| D2L4NTFS | 02:03 | 1.95 / 10.66 | ALL 20927 MATCHED | all ✓ |
+| D2BLFAT32 | 02:53 | 4.35 / 10.28 | ALL 20974 MATCHED | all ✓ |
+Laptop: ALL CLEAN.
+
+### Samsung M30 · Drive 3 · 10-21 10:13 – 10-22 08:50
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| D3EXT2 | 10:25 | — | ALL 21821 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3EXT3 | 10:37 | — | ALL 21883 MATCHED | read sections ✓; writes SKIPPED (ro) |
+| D3L1EXFAT | 11:11 | — | — | **FAILED** (bigwrite): java.io.IOException: exFAT write failed at offset 337132679 (0 of 3145728 bytes written):… |
+| D3L1NTFS | 19:27 | 1.99 / 10.52 | ALL 20920 MATCHED | all ✓ |
+| D3L2FAT32 | 20:24 | 4.04 / 9.10 | ALL 20913 MATCHED | all ✓ |
+| D3L2NTFS | 21:33 | 1.95 / 10.49 | ALL 20925 MATCHED | all ✓ |
+| D3L2EXT4 | 22:31 | 3.31 / 9.54 | ALL 20939 MATCHED | all ✓ |
+| D3L4FAT32 | 23:31 | 2.90 / 9.45 | ALL 20972 MATCHED | all ✓ |
+| D3L4EXFAT | 00:13 | — | — | **FAILED** (bigwrite): java.io.IOException: exFAT write failed at offset 1175425777 (0 of 1048576 bytes written):… |
+| D3L1EXFAT | 06:37 | 3.87 / 8.95 | ALL 20929 MATCHED | all ✓ |
+| D3L4EXFAT | 07:43 | 2.47 / 9.07 | ALL 20910 MATCHED | all ✓ |
+| D3BLNTFS | 08:50 | 1.94 / 11.43 | ALL 21023 MATCHED | all ✓ |
+D3L1EXFAT and D3L4EXFAT each lost the stick in the big write (36 failed transfers, the device
+never answered again until replugged); both reran clean. Laptop after the failures and after the
+reruns (two read-backs): ALL CLEAN.
+
+### Samsung M30 · Drive 5 — **FAILED**, USB dropouts
+
+| Partition | Finished | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|
+| copy 10-19 · VC_ATS_ARGON_PIM0 | 21:42 | — | — | **FAILED** (seq read, random read, write verify, unaligned, correctness, bigwrite): java.io.IOException: Item already exists!… |
+| copy 10-20 · VC_ATS_ARGON_PIM0 | 11:58 | 2.11 / 2.59 | ALL 20902 MATCHED | all ✓ |
+| copy 10-20 · VC_STA_ARGON_PIM1 | 13:36 | 1.35 / 2.80 | ALL 20965 MATCHED | all ✓ |
+| copy 10-20 · VC_TWO_SHA512_PIM0 | 14:43 | 1.84 / - | — | **FAILED** (bigwrite, fixtures): java.io.IOException: NTFS directory listing failed: I/O error (EIO)… |
+| copy 10-22 · VC_TWO_SHA512_PIM0 | 09:07 | — | — | no result (nothing mounted; dropped) |
+| copy 10-22 · VC_AT_ARGON_PIM1 | 09:24 | — | — | **FAILED** (bigwrite): java.io.IOException: exFAT write failed at offset 656973435 (0 of 777777 bytes written): -… |
+| original 10-22 · VC_ATS_ARGON_PIM0 | 05:26 | — | — | **FAILED** (bigwrite, fixtures): java.io.IOException: read failed: chunk of 8 blocks at 5168648 (request was 8 blocks at 51… |
+| original 10-22 · VC_ATS_ARGON_PIM0 | 11:50 | 1.07 / 1.08 | — | **FAILED** (fixtures): java.io.IOException: read failed: chunk of 32 blocks at 1062720 (request was 256 blocks at… |
+The copy (…EF455) on 10-19, 10-20 and 10-22 09:03; the original (…EF449) on 10-22 04:45 and 09:28. Every
+failure is the same event: a transfer times out (`result == -1 errno 0`), Reset Recovery and six
+retries five seconds apart get no answer, and the stick stays enumerated on the bus (checked on
+the M30 after the last one: `154b:1006 … 071C48F5FB0EF449`, 480 Mbit/s) but never responds again
+until replugged. The same build and sticks pass all ten partitions on the Pixel and the OnePlus;
+on the M30, Drives 1 and 2 see at most one or two recovered retries per run, while Drive 3 and
+both Drive 5 sticks lose the link. Drive 5 is the most exposed: VeraCrypt cascades with Argon2
+run at about 1 MB/s on this phone, so a partition takes over two hours. Run 3 on the copy passed two partitions
+before losing the stick in the third; the last attempt on the original passed the big write and
+dropped 47 minutes later in the fixture read.
+
+What the cut-offs left, from the laptop:
+- **…EF455 p3 (VC_TWO_SHA512_PIM0, NTFS), 10-20:** `ntfs_check`: 191 clusters in use but free in
+  `$Bitmap` — the MFT record was written and the bitmap was not. Restored with `make_d5_stick.sh`,
+  CLEAN, rebaselined. Writing the bitmap before the record would leave leaked clusters instead of
+  doubly-owned ones; noted for 0.4.3.
+- **…EF449 p1 (VC_ATS_ARGON_PIM0, FAT32), 10-22 05:26:** free-cluster summary wrong (917094 vs
+  1451416) — FSInfo not rewritten. Restored, CLEAN (20902 fixtures), rebaselined.
+- …EF455 p1/p2 after run 3: CLEAN.
+- **Pending:** …EF455 p4 (cut off 10-22 09:24, exFAT) and …EF449 p1 (dropped in a read, 10-22
+  11:50) have not been back on the laptop yet.
+
+A full USB reset (`USBDEVFS_RESET`) after Reset Recovery fails is the one recovery step libaums
+does not try (`resetDevice()` exists and is never called). Planned for 0.4.3, to be tested on the
+M30 since it reproduces there.
+
+### Runs that produced no result
+
+- **M30, D1EXT4, 10-21 07:26:** USB errors at unlock, nothing mounted.
+- **M30, D5 copy VC_TWO_SHA512_PIM0, 10-22 09:07:** the same, at unlock.
+- **M30, D5 copy VC_ATS_ARGON_PIM0, 10-19 22:11:** USB errors from the start; stopped, no report.
+- **OnePlus 7, D5 ENC_TO_FAT32, 10-19 02:37:** the phone had locked; nothing mounted; rerun 10-20.
+
+---
+
+## 2026-10-16 (night) to 2026-10-18 — the 0.4.2 release-candidate matrix on `325548b` / `b7810ee`, and three changes measured on top
+
+The first 0.4.2 matrix round. `325548b` and `b7810ee` are the same tree (#68 rebase-merged one onto
+`main` as the other), so their rows belong together. Every run below is one partition by
+`matrix/helpers/sequence_runs.sh` → `start_run.sh`: password123, PIM 1, AES/SHA-512 unless the
+partition says otherwise, cache default, remount true, and **`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`** ("full"). Read-only
+partitions (ext2/ext3, APFS) skip the write sections themselves (`writes SKIPPED(ro)`). Every
+report's `commit` line was checked against the build installed. After each drive's runs it went to
+the laptop: `read_matrix_drive.sh` + `verify_matrix_drive.py` (each partition's own checker,
+read-only, plus a byte compare against the drive's baseline), or for Drive 5 `verify_volume.sh` +
+`volume_baseline.sh compare`. Devices: **OnePlus 7** (GM1901, LineageOS 23.2, Android 16), **Samsung
+M30** (SM-M305F, Android 10), **realme 8** (RMX3085, Android 13).
+
+The round stopped on 2026-10-18 when PRs #74–#77 went into 0.4.2: the matrix restarts on the final
+`main`, and these rows stay as the record of `b7810ee`.
+
+### OnePlus 7 · Drive 2 (copy, …EF451) · 10-16 22:48 – 10-17 06:51
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D2L1EXT4 | `…0052` | `325548b` | full | 21.99 | 5.31 / 12.89 | ALL 21024 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2L1FAT32 | `…0030` | `325548b` | full | 23.80 | 6.66 / 12.62 | ALL 20953 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2L2EXFAT | `…0115` | `325548b` | full | 18.48 | 6.14 / 12.60 | ALL 20942 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2L4EXT4 | `…0139` | `325548b` | full | 27.78 | 5.12 / 12.81 | ALL 20888 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2L4NTFS | `…0203` | `325548b` | full | 21.49 | 2.71 / 16.67 | ALL 20927 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2VCEXFAT | `…2311` | `325548b` | full | 23.49 | 6.14 / 12.68 | ALL 20974 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2VCEXT4 | `…0007` | `325548b` | full | 20.98 | 5.56 / 12.90 | ALL 21071 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2VCFAT32 | `…2248` | `325548b` | full | 19.62 | 5.65 / 13.22 | ALL 20958 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2VCNTFS | `…2336` | `325548b` | full | 21.42 | 2.74 / 16.80 | ALL 20919 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D2BLFAT32 | `…0651` | `b7810ee` | full | 29.68 | 6.27 / 13.36 | ALL 20974 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+Laptop after the ten runs: **ALL CLEAN**, every fixture present, each partition's checker clean.
+
+### OnePlus 7 · Drive 3 · 10-17 08:05 – 11:33
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D3BLNTFS | `…1133` | `b7810ee` | full | 24.92 | 2.82 / 17.31 | ALL 21023 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3EXT2 | `…0805` | `b7810ee` | read-only (writes SKIPPED, ro) | 45.24 | — | ALL 21821 MATCHED | read sections ✓ |
+| D3EXT3 | `…0811` | `b7810ee` | read-only (writes SKIPPED, ro) | 45.92 | — | ALL 21883 MATCHED | read sections ✓ |
+| D3L1EXFAT | `…0818` | `b7810ee` | full | 21.81 | 6.22 / 12.72 | ALL 20929 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L1NTFS | `…0844` | `b7810ee` | full | 23.34 | 2.86 / 16.68 | ALL 20920 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L2EXT4 | `…1011` | `b7810ee` | full | 23.03 | 5.29 / 12.71 | ALL 20939 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L2FAT32 | `…0915` | `b7810ee` | full | 18.59 | 5.98 / 13.12 | ALL 20913 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L2NTFS | `…0938` | `b7810ee` | full | 20.10 | 2.81 / 16.42 | ALL 20925 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L4EXFAT | `…1102` | `b7810ee` | full | 19.65 | 4.18 / 12.76 | ALL 20910 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L4FAT32 | `…1036` | `b7810ee` | full | 22.82 | 4.50 / 12.70 | ALL 20972 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+Laptop after the runs: 8 of 10 CLEAN. **D3EXT2 and D3EXT3, never written by the app, had 1 MiB
+changed** — the superblock. LineageOS's vold mounts every partition it recognises when a stick is
+plugged in, ext2/ext3 included, and stamps `s_mtime`/`s_wtime`/`s_mnt_count` (and the ext2 state).
+Not the app; its reads of those partitions are read-only by construction. Both restored with
+`write_matrix_drive.sh --only` (user-approved) and re-verified **ALL CLEAN** with new baselines.
+
+### OnePlus 7 · Drive 4 · 10-17 12:12 – 13:37
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D4BLEXFAT | `…1337` | `b7810ee` | full | 23.50 | 6.62 / 13.51 | ALL 21073 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D4BLFAT32 | `…1314` | `b7810ee` | full | 22.94 | 6.11 / 13.02 | ALL 20918 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D4L1EXT2 | `…1212` | `b7810ee` | read-only (writes SKIPPED, ro) | 20.12 | — | ALL 21870 MATCHED | read sections ✓ |
+| D4L1EXT3 | `…1219` | `b7810ee` | read-only (writes SKIPPED, ro) | 20.58 | — | ALL 21875 MATCHED | read sections ✓ |
+| D4L2EXT2 | `…1227` | `b7810ee` | read-only (writes SKIPPED, ro) | 27.36 | — | ALL 21678 MATCHED | read sections ✓ |
+| D4L2EXT3 | `…1235` | `b7810ee` | read-only (writes SKIPPED, ro) | 23.31 | — | ALL 21971 MATCHED | read sections ✓ |
+| D4L4EXT2 | `…1243` | `b7810ee` | read-only (writes SKIPPED, ro) | 21.77 | — | ALL 21916 MATCHED | read sections ✓ |
+| D4L4EXT3 | `…1251` | `b7810ee` | read-only (writes SKIPPED, ro) | 21.44 | — | ALL 21846 MATCHED | read sections ✓ |
+| D4VCEXT2 | `…1259` | `b7810ee` | read-only (writes SKIPPED, ro) | 23.67 | — | ALL 21948 MATCHED | read sections ✓ |
+| D4VCEXT3 | `…1306` | `b7810ee` | read-only (writes SKIPPED, ro) | 23.44 | — | ALL 21956 MATCHED | read sections ✓ |
+
+Laptop after the runs: **ALL CLEAN**; the eight read-only partitions byte-identical to their baselines.
+
+### Samsung M30 · Drive 1 · 10-16 22:48 – 10-17 11:58
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D1FAT32 | `…2248` | `325548b` | read-only (writes SKIPPED, ro) | 27.31 | — | — | **FAILED** (see below) |
+| D1BLEXFAT | `…0740` | `b7810ee` | full | 10.35 | 3.67 / 9.50 | ALL 20898 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1BLNTFS | `…0808` | `b7810ee` | full | 11.07 | 1.97 / 11.25 | ALL 20905 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1EXFAT | `…0648` | `b7810ee` | full | 24.53 | 5.79 / 16.01 | — | write verify ✓; correctness ✓; bigwrite ✓ after remount; **FAILED** (see below) |
+| D1EXT4 | `…0706` | `b7810ee` | full | 29.41 | 4.87 / 15.87 | ALL 20854 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1FAT32 | `…0630` | `b7810ee` | full | 28.43 | 5.32 / 16.37 | ALL 20995 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1NTFS | `…0724` | `b7810ee` | full | 29.17 | — | — | write verify ✓; correctness ✓; **FAILED** (see below) |
+| D1APFSCI | `…1103` | `b7810ee` | read-only (writes SKIPPED, ro) | 26.92 | — | ALL 22129 MATCHED | read sections ✓ |
+| D1APFSCS | `…1120` | `b7810ee` | read-only (writes SKIPPED, ro) | 26.51 | — | ALL 22024 MATCHED | read sections ✓ |
+| D1APFSECI | `…1138` | `b7810ee` | read-only (writes SKIPPED, ro) | 24.96 | — | ALL 21777 MATCHED | read sections ✓ |
+| D1APFSECS | `…1158` | `b7810ee` | read-only (writes SKIPPED, ro) | 23.81 | — | ALL 21911 MATCHED | read sections ✓ |
+| D1EXFAT | `…1013` | `b7810ee` | full | 24.22 | 5.63 / 15.61 | ALL 20963 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1NTFS | `…1034` | `b7810ee` | full | 23.23 | 2.37 / 19.03 | ALL 21052 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+**The FAILED rows are USB, not the file systems,** and all three were on a VIA USB-C multiport adapter
+(LAN + hub): `MAX_RECOVERY_ATTEMPTS Exceeded` and EIO (-5) from libaums mid-transfer —
+- D1FAT32 `…2248` (`325548b`): write verify failed reading a chunk (`MAX_RECOVERY`), and the rest
+  followed from the dead handle ("could not create a working directory", "Item already exists!");
+- D1EXFAT `…0648`: fixtures failed on an exFAT read (-5) after a passing bigwrite;
+- D1NTFS `…0724`: bigwrite and fixtures failed with EIO.
+
+The user changed to a direct adapter; D1EXFAT and D1NTFS were rerun (`…1013`, `…1034`) and passed.
+Laptop after the runs: 9 CLEAN, **D1FAT32 NOT CLEAN — one orphan cluster** (`fsck.fat`: "Reclaimed 1
+unused cluster"). FAT32 has no journal, and the 22:48 run lost the drive mid-operation, which is
+exactly what leaves one. D1 restored (user-approved) and re-verified **ALL CLEAN**; the OnePlus
+D1FAT32 run afterwards (next table) left it CLEAN — no leak in 0.4.2 on a working link.
+
+### OnePlus 7 · Drive 1 · 10-17 15:11 – 17:40
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D1APFSCI | `…1701` | `b7810ee` | read-only (writes SKIPPED, ro) | 52.01 | — | ALL 22129 MATCHED | read sections ✓ |
+| D1APFSCS | `…1713` | `b7810ee` | read-only (writes SKIPPED, ro) | 50.69 | — | ALL 22024 MATCHED | read sections ✓ |
+| D1APFSECI | `…1725` | `b7810ee` | read-only (writes SKIPPED, ro) | 45.53 | — | ALL 21777 MATCHED | read sections ✓ |
+| D1APFSECS | `…1740` | `b7810ee` | read-only (writes SKIPPED, ro) | 49.77 | — | ALL 21911 MATCHED | read sections ✓ |
+| D1BLEXFAT | `…1616` | `b7810ee` | full | 27.48 | 5.70 / 12.70 | ALL 20898 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1BLNTFS | `…1636` | `b7810ee` | full | 23.80 | 2.73 / 17.28 | ALL 20905 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1EXFAT | `…1524` | `b7810ee` | full | 42.34 | 8.77 / 18.05 | ALL 20963 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1EXT4 | `…1600` | `b7810ee` | full | 55.96 | 6.15 / 18.72 | ALL 20854 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1FAT32 | `…1511` | `b7810ee` | full | 53.53 | 7.61 / 15.51 | ALL 20995 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D1NTFS | `…1539` | `b7810ee` | full | 53.64 | 3.03 / 26.29 | ALL 21052 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+Laptop after the runs: **ALL CLEAN**, D1FAT32 included.
+
+### Samsung M30 · Drive 3 · 10-17 15:11 – 10-18 10:40
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D3EXT2 | `…1511` | `b7810ee` | read-only (writes SKIPPED, ro) | 25.72 | — | ALL 21821 MATCHED | read sections ✓ |
+| D3EXT3 | `…1523` | `b7810ee` | read-only (writes SKIPPED, ro) | 25.44 | — | ALL 21883 MATCHED | read sections ✓ |
+| D3L1EXFAT | `…1536` | `b7810ee` | full | 10.51 | — | — | write verify ✓; correctness ✓; **FAILED** (see below) |
+| D3L1EXFAT | `…1902` | `b7810ee` | full | 10.31 | 3.87 / 8.29 | ALL 20929 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L1NTFS | `…0923` | `b7810ee` | full | 10.43 | 1.58 / 8.93 | ALL 20920 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| D3L2FAT32 | `…1040` | `b7810ee` | full | 10.20 | 3.98 / 8.52 | ALL 20913 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+D3L1EXFAT `…1536` **FAILED** in bigwrite: the stick stopped answering 380 MB into the 2.2 GB write
+(`exFAT write failed at offset 379764702 … -5`), again on the VIA multiport adapter; the app then
+could not write its report to the drive. Laptop: **ALL CLEAN** (the partition kept a 0-byte
+`big.bin` and its fixtures). Rerun at the user's request on the same adapter (`…1902`): passed, with
+three `MAX_RECOVERY` reads that libaums recovered. D3L1NTFS and D3L2FAT32 passed; the sequence was
+then stopped for the 0.4.2 additions. Laptop after: **ALL CLEAN**.
+
+### OnePlus 7 · Drive 5 (copy, …EF455) · 10-18
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| VC_ATS_ARGON_PIM0 | `…0939` | `b7810ee` | reduced¹ | 0.08 | — | — | write verify ✓; correctness ✓ |
+| VC_STA_ARGON_PIM1 | `…1006` | `b7810ee` | reduced¹ | 0.08 | — | — | write verify ✓; correctness ✓ |
+| VC_TWO_SHA512_PIM0 | `…1026` | `b7810ee` | full | 18.49 | 2.84 / 13.80 | ALL 20962 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| VC_SA_SHA512_PIM1 | `…1541` | `7837d2d` | full | 7.87 | 3.69 / 6.63 | ALL 20915 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+| VC_ATS_ARGON_PIM0 | `…1608` | `7837d2d` | full | 6.47 | 3.77 / 5.43 | ALL 20902 MATCHED | write verify ✓; correctness ✓; bigwrite ✓ after remount |
+
+¹ `free,block,dir,path,write,unaligned,correct`: every cipher with Serpent read at **0.08 MB/s** —
+the vendored 1998 reference implementation — where bigwrite and fixtures would each have taken
+hours. The last two rows are build **`7837d2d`** (PR #77), where the Linux kernel's bitsliced
+Serpent replaces it: Serpent-AES now runs the full suite at 7.87 MB/s, the three-cipher cascade at
+6.47. Laptop after all five: p1, p3 and p5 `fsck` **CLEAN**; the allocation tables changed only as
+the runs wrote (p1/p5 ≈ 446,000 FAT entries ≈ 2.2 GB of clusters; p3's NTFS bitmap); exFAT p2/p7/p10
+changed one byte, the "percent in use" field, from being mounted; the rest identical.
+
+### realme 8 · Drive 2 (…2D62) · 10-18 13:13 — issue #71
+
+| Partition | Report | Build | Sections | Block read 4 MiB (MB/s) | bigwrite write / read-back (MB/s) | Fixtures | Verdict |
+|---|---|---|---|---|---|---|---|
+| D2VCEXFAT | `…1313` | `26ef076` | read-only (writes SKIPPED, ro) | 9.27 | — | ALL 20974 MATCHED | read sections ✓ |
+
+Read-only, on `26ef076`, to look at issue #71 (large USB transfers failing on realme/OnePlus
+Android 16 phones). The first 64 KiB read failed with `MAX_RECOVERY`, also with the stick plugged in
+directly; 0.4.1's step-down to 32 KiB then carried the whole run, including the 2.1 GB sequential
+read. Nothing written, so no laptop check.
+
+### Runs that produced no result (dropped, listed so the gaps are explained)
+
+- **M30, D1EXFAT, 10-17:** stalled before its first section — the phone, on an adapter that does not
+  charge it, let the screen doze.
+- **OnePlus 7, D2BLFAT32, 10-17:** hung on the USB permission dialog after a reinstall; restarted.
+- **M30, D3L1NTFS, 10-18 09:21:** Android killed the app as it started, straight after a reinstall
+  ("timeout publishing content providers"); the benchmark ran without the activity and mounted nothing.
+- **OnePlus 7, D5 p1, 10-18 09:35:** stopped after the block reads to give the Serpent partitions the
+  reduced set (0.08 MB/s).
+- **realme 8, D2VCEXFAT, 10-18 12:55:** the run helper sent no PIM (a bug in the helper, fixed); stopped
+  before the unlock finished. **12:56:** the USB-C hub dropped off the port at 13:04 (power
+  renegotiation, all three devices on it removed); the mount never completed.
+- **OnePlus 7, D5 p5, 10-18 15:39:** the phone had locked (a secure lock screen, now that phones sleep
+  between runs); the app opened behind it and mounted nothing. `start_run.sh` now waits for an unlock.
+
+### Commit hashes after the merges of #68, #74–#78 and #81
+
+`main` requires linear history, so each PR was rebase-merged and its commits given new hashes.
+Same order, same subjects; each change identical to the one tested (#77 was based on `6cde6eb` and landed on `47b4f04`, so its tree also carries #76 — `git diff 6cde6eb 7837d2d` equals `git diff 47b4f04 4b5b630`)). #78 was based on `4b5b630`, the tip of `main`, so its tree is unchanged by the merge: the D5 runs on APKs stamped `6e281db` measured exactly `de98da6`.
+
+| On the branch (cited) | On `main` | PR | Commit |
+|---|---|---|---|
+| `7a42e7d` | `0cdaf2a` | #68 | bench: time the USB layer in bigwrite; xfer extra to try transfer sizes |
+| `2a184b5` | `27efed5` | #68 | libaums: a partial-sector write tail reads one sector, not the span (V21) |
+| `76d28be` | `a3dc383` | #68 | bench: the xfer extra applies to USB devices already open |
+| `2a79076` | `2509489` | #68 | experiment: V19's FAT32 write runs back, measured with V21 |
+| `325548b` | `b7810ee` | #68 | docs: record the FAT32 write-run A/B; ship V19 with V21 |
+| `5ebcb43` | `26ef076` | #74 | feat(ui): Encrypt picks a type and takes keyfiles; Format picks a filesystem; ERASE in a dialog |
+| `9de8b29` | `6cde6eb` | #75 | fix: drives over 1 TiB showed "Unknown"; videos would not play from the Files app |
+| `b38f3c6` | `47b4f04` | #76 | feat: say "OTG is switched off" only when it is, on OPPO/realme/OnePlus |
+| `7837d2d` | `4b5b630` | #77 | perf: Serpent ~140x faster - the Linux kernel's bitsliced code replaces the 1998 reference |
+| `6e281db` | `de98da6` | #78 | fix: the app stopped responding while a long write held a drive |
+| `5150d64` | `4c6a02d` | #81 | docs: record the 0.4.2 matrix round on b7810ee and the runs since; hash table for #68, #74-#77 |
+| `3b42309` | `c7b130e` | #81 | docs: v0.4.2 regression report, the release matrix on 6e281db, store screenshots |
+
+---
+
+## 2026-10-16 (night) — FAT32 write runs again (V19 + V21): D1FAT32 on the OnePlus 7, six runs
+
+Measurement runs for `perf/fat32-speed`. Each run: `--es tests free,bigwrite --es drive D1FAT32`,
+password123, cache default, remount true, and `--es xfer` named explicitly. Phone on USB power,
+100%, interactive, no power save, at start and end. Each header names its commit (clean
+tree). `2a79076` is V19 + V21 with the USB timing. `76d28be` is the same branch one commit
+earlier: V21 and the timing, upstream's four-cluster writes. The last four runs alternate the
+two builds, so the drive's state over the evening cannot favour either.
+
+| Run · build · transfer | Report | bigwrite write / read after remount | USB layer during the write | Verdict |
+|---|---|---|---|---|
+| `2a79076` · 120 KiB · 19:46 | `…-195430.txt` | **8.46** / 15.62 | 15.8 commands per MiB; 85.3% inside them, 10.45 MB/s there; 11.5 MiB read | ALL PASSED after remount (240 tree files) |
+| `2a79076` · 1 MiB · 19:54 | `…-200212.txt` | 7.96 / 21.14 | **1024 KiB transfers**, 7.9 per MiB; 86.3%, 9.72 MB/s; 11.5 MiB read | ALL PASSED after remount |
+| A1 `76d28be` · 120 KiB · 20:03 | `…-201349.txt` | **5.71** / 16.69 | 71.3 per MiB; 88.0%, 6.83 MB/s; 11.5 MiB read | ALL PASSED after remount |
+| B1 `2a79076` · 120 KiB · 20:14 | `…-202239.txt` | **7.80** / 17.22 | 15.8 per MiB; 86.7%, 9.47 MB/s; 11.2 MiB read | ALL PASSED after remount |
+| A2 `76d28be` · 120 KiB · 20:23 | `…-203352.txt` | **5.15** / 17.93 | 71.3 per MiB; 89.0%, 6.09 MB/s; 11.0 MiB read | ALL PASSED after remount |
+| B2 `2a79076` · 120 KiB · 20:34 | `…-204236.txt` | **7.66** / 18.63 | 15.8 per MiB; 87.1%, 9.26 MB/s; 10.7 MiB read | ALL PASSED after remount |
+
+Host after the six runs (laptop, `verify_volume.sh /dev/sda6`): **CLEAN**, `fsck.fat 4.2`
+read-only, 21322 files, 1347186/1430796 clusters. No baseline exists for D1FAT32, so there
+is no allocation-table compare.
+
+**V19 + V21 against upstream's writes, alternated: 7.80 and 7.66 MB/s against 5.71 and
+5.15, about 1.4×.** The tree step dropped from 57 s to 42–43 s. Without V21 the same V19
+read 1 GB more and measured 7.31 MB/s (`9092017`, the earlier entry).
+
+- **V21 works.** Reads during the write fell from 1017.9 MiB to 11.5 MiB.
+- **A larger transfer does not help.** At 1 MiB the rate inside USB commands was 9.72 MB/s
+  against 10.45 at 120 KiB. The link to this stick tops out at about 10 MB/s on this phone,
+  whatever the command size. The app keeps 120 KiB, and `xfer` stays a debug-only knob.
+- **What is left is metadata.** Of 15.8 commands per MiB, about 8 are data and the rest
+  are FAT and FsInfo updates at the start of the partition. Removing those means deferring
+  metadata writes, the trade-off already declined for ext4 (#36 phase 4).
+- **Earlier days' upstream figures (7.73–8.45) are not this baseline.** They come from
+  other sessions, and the alternated runs are the comparison.
+
+## 2026-10-16 (evening) — V20, the FAT32 directory-copy fix: D1FAT32 on the OnePlus 7
+
+One run, on the build of `e2c8d10` (clean tree; the report's header reads `commit e2c8d10`),
+`--es drive D1FAT32`, password123, cache default, remount true. Sections, all named:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`. Phone on
+USB power, 100%, interactive, no power save, at start and end. Started 17:38:37 (phone clock).
+Report `BENCH/reports/otgbench-GM1901-20261016-175237.txt`. D1FAT32 had just been
+restored from the build image after the failed run below (19.6 MB/s; fsck.fat CLEAN, 21051 files).
+
+| Device · Android | Drive · when | On the phone | Host |
+|---|---|---|---|
+| OnePlus 7 · 16 | D1FAT32 (plain) · 10-16 17:38 | write verify ALL PASSED, 16 MiB at 2.29 MB/s; unaligned A+B PASS; correctness A–G ALL PASSED; bigwrite 6.03 / 14.86, ALL PASSED after remount (240 tree files); fixtures ALL 20995 MATCHED | `verify_volume.sh /dev/sda6`: fsck.fat **CLEAN**, 21316 files, 1347180/1430796 clusters |
+
+A pass does not prove the fix: the failure needs a GC in a narrow window. `Fat32HandleAliasTest`
+is the proof. It forces the collection, fails on the old code and passes on this one. This run
+shows that V20 changes nothing else on the device's FAT32 path.
+
+**Commit hashes after the merge of #67** (rebase-merge):
+
+| On the branch (cited) | On `main` | Commit |
+|---|---|---|
+| `bc3f2a8` | `d8a7d17` | test: a GC can leave two copies of a FAT32 directory, and one loses entries |
+| `e2c8d10` | `23fc40b` | fix: a GC could leave two copies of a FAT32 directory, losing entries (V20) |
+| `5677c3a` | `8527f76` | docs: record V20's D1FAT32 run on the OnePlus |
+
+## 2026-10-16 (later) — where FAT32's write time goes: D1FAT32 on the OnePlus 7, three runs
+
+These runs were for measurement. They used builds from `perf/fat32-writes`, which time the USB layer inside
+`bigwrite` (commands, bytes, ms inside `driver.write`). Each run: `--es tests free,bigwrite
+--es drive D1FAT32`, password123, cache default, remount true. Phone on USB power, 100%, interactive.
+Each header names its commit (clean tree).
+
+| Build · when | Report | bigwrite write / read after remount | USB layer during the write | Verdict |
+|---|---|---|---|---|
+| `b26241c` (upstream four-cluster writes) · 08:47–08:58 | `…-085819.txt` | 5.62 / 15.68 | 120 KiB limit; 149,684 write commands, **71.3 per MiB**; 88.1% of the time inside them, 6.71 MB/s there; 12.3 MiB read | ALL PASSED after remount (240 tree files) |
+| `9092017` (V19's runs put back) · 08:59–09:08 | `…-090809.txt` | 7.31 / 16.22 | 120 KiB; 33,199 write commands, **15.8 per MiB**; 76.3%, 10.09 MB/s inside; **1017.9 MiB read** | ALL PASSED after remount (240 tree files) |
+| `9092017`, `--es xfer 1048576` · 09:08–09:16 | `…-091653.txt` | 7.11 / 17.32 | **still 120 KiB**: the override did not apply, because the open USB device was reused; 33,200 commands, 77.1%, 9.71 MB/s inside, 1016.7 MiB read | **FAILED — `d2/e2/f71.bin` missing** after remount; big file verified |
+
+Host after the failed run: **D1FAT32 NOT CLEAN**. `verify_volume.sh` on `/dev/sda6` →
+fsck.fat "Reclaimed 355 unused clusters (1454080 bytes)", "Free cluster summary wrong
+(83611 vs. really 83966)". The file's data is still allocated, but its directory entry is gone.
+`fsck.vfat -l` on the read-back image lists neither `d2/e2/f71.bin` nor `d3/e1/f71.bin`.
+
+**Cause: two in-memory copies of one directory, found by `Fat32HandleAliasTest`, on main's
+libaums code.** Every FatDirectory holds its entry list as read from disk and writes the whole
+list back on each change. libaums finds handles again through `fs.fileCache`, a
+`WeakHashMap<String, UsbFile>` keyed by path strings nothing else holds. Any GC
+empties it while the directory objects are still referenced, for example by a file handle's `parent`.
+The next lookup then reads a second copy. Here `f71.bin` was moved into one copy of
+`d2/e2`. A delete through an older handle then wrote the other copy, which had never seen
+f71. The test clears the cache by reflection, as a GC does, and fails with
+`d/e/moved.bin was lost`.
+`FatDirectory.kt` and `Fat32FileSystem.kt` are identical on main (`53d2b6d`), and the test fails
+there too, so this is not V19. Fixed by V20 (`e2c8d10`, the entry above). It is GC-timed. The V19 builds read 1 GB more than they needed
+(below), and allocating that much keeps the collector busy, which made the window likely.
+The same build passed the same tree 10 minutes earlier.
+
+**What the numbers say:**
+- FAT32 writes are bound by USB time. 76–88% of the wall clock is inside SCSI commands,
+  about 2.2 ms per command at 71 per MiB.
+- Merging runs (V19) raised the rate inside USB from 6.7 to 10.1 MB/s, as commands went from
+  71 to 16 per MiB. A new cost ate the gain: 1 GB of reads.
+- The reads come from `ByteBlockDevice.write` (V1). When a write ends partway through a
+  sector it reads the **whole** span before overlaying, not just its last sector. That was cheap at
+  16 KiB and costs a 1 MiB read at V19's run size.
+- The 1 MiB transfer comparison did not happen and has to be rerun. The override must take
+  effect when the USB device is opened.
+
+## 2026-10-16 — exFAT and FAT32 write in runs (E2, V19): D1 on the OnePlus 7
+
+One run, on the build of `3971906` (clean tree; the report's header reads `commit 3971906`),
+`--es drive D1FAT32,D1EXFAT,D1BLEXFAT`, password123, cache default, remount true.
+Sections, all named: `free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`.
+Phone on USB power, 100%, interactive, no power save, at start and end. Started
+04:51:03 and ended about 05:34. Report `BENCH/reports/otgbench-GM1901-20261016-053441.txt`
+on the drive.
+
+D1FAT32 had been restored from the build images the day before (19.4 MB/s raw write
+over the laptop's USB, fsck CLEAN, 21051 files). This time vold's `fsck_msdos` at
+plug-in did not leave it dirty.
+
+| Device · Android | Drive · when | On the phone | Host |
+|---|---|---|---|
+| OnePlus 7 · 16 | D1: FAT32, EXFAT, BLEXFAT (BitLocker XTS-256) · 10-16 04:51–05:34 | All three: write verify ALL PASSED, unaligned A+B PASS, correctness ALL PASSED (F skipped on D1EXFAT: no cache in the stack), bigwrite ALL PASSED after remount, fixtures ALL MATCHED (20995 / 20963 / 20898). **bigwrite: FAT32 7.79 / 14.76, EXFAT 8.95 / 18.68, BLEXFAT 5.66 / 12.74**. 16 MiB `write`: 1.90 / 0.47 / 0.50 MB/s | `verify_volume.sh`: `/dev/sda6` fsck.fat CLEAN (21316 files), `/dev/sda7` fsck.exfat CLEAN (21219 files). Read-back and `verify_matrix_drive.py` (07:29, laptop clock): **Drive 1: ALL CLEAN**, all 10 partitions. D1BLEXFAT bitlocker/exfat clean, big.bin 2,200,000,000 B OK, tree 248/248 |
+
+bigwrite write MB/s against the same phone and drive on earlier builds:
+
+| | D1EXFAT | D1BLEXFAT | D1FAT32 |
+|---|---|---|---|
+| 10-04, `23480de` (run 7) | 0.78 | 0.71 | 8.45 |
+| 10-07, `2a6fe4f` | 0.88 | skipped | 8.01 |
+| 10-10, `ae25575` (0.4.1) | 1.76 | 1.53 | 7.73 |
+| **10-16, `3971906`** | **8.95** | **5.66** | **7.79** |
+
+Write commands per MiB on the host (`ExFatWriteRunsTest`, `Fat32WriteRunsTest`, 16 MiB
+in 1 MiB calls, 4 KiB clusters): exFAT 256 → 1.0, FAT32 69.1 → 6.1 (the FAT32 test left with V19, below).
+
+**exFAT: 5.1× the 0.4.1 figure, and now faster than FAT32 on this drive.** BitLocker
+exFAT 3.7×. libexfat used to make one device call per cluster, 256 per MiB, each one
+a JNI upcall. That cost about 5 ms per call at 0.78–1.76 MB/s.
+
+**FAT32: no change.** 7.79 lies inside the 7.73–8.45 spread of the earlier rows.
+The 64 data commands per MiB it no longer sends were evidently cheap. At 8.45 MB/s
+they could have cost at most about 1.8 ms each, all sequential on the stick.
+What FAT32 spends its time on is not measured. At 7.79 MB/s one MiB takes
+about 128 ms, against about 52 ms at the stick's raw 19.4 MB/s. Possible causes,
+none tested: the FAT and FsInfo writes each call makes (about 5 per MiB, at the start
+of the partition), CPU work in libaums, or a lower USB ceiling on the phone than on
+the laptop. **V19 was dropped after this run**: no measured gain is not a reason to
+carry a vendored patch. The PR ships E2 only, and `ClusterChain.write` is upstream's
+again. The FAT32 row above measured `3971906`, which still contained V19. The exFAT
+rows measured the same `io.c` the PR ships.
+
+**Reads were slower on this day, including files this change never wrote.** The host-written
+`large/seq_2100m.bin` fixture read at 15.55 / 19.74 / 12.94 MB/s, against 27.73 /
+48.39 / 26.96 on 10-10. bigwrite's read after remount is down by about the same factor.
+The patches change only write paths (`exfat_generic_pwrite`, `ClusterChain.write`).
+The 10-15 ext4 run on the same phone showed the same drop (17.74 against 40–44) before
+this branch existed. So the drop comes from the phone or the drive on these days, not
+from this change. Its cause is not known.
+
+**Commit hashes after the merge of #66** (rebase-merge, so new hashes). The rows above,
+the PR and the commit messages cite the branch hashes:
+
+| On the branch (cited) | On `main` | Commit |
+|---|---|---|
+| `3971906` | `b0f0385` | perf: exFAT and FAT32 write in runs of consecutive clusters |
+| `51f8b5a` | `fba5a05` | docs: record the D1 run of the exFAT/FAT32 write runs; FAT32 did not speed up |
+| `e49ee6b` | `e45a0d1` | libaums: drop V19, keep upstream's four-cluster FAT32 writes |
+
+## 2026-10-15 — ext4 writes in runs (#36), journal repair: D1EXT4 on the OnePlus 7
+
+One run, on the build of `e32a6b3` (clean tree; the report's header reads `commit e32a6b3`),
+`--es drive D1EXT4`, password123, cache default, remount true. Sections, all named:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`. Phone on
+USB power, 100%, interactive, no power save, at start and end. Report
+`BENCH/reports/otgbench-GM1901-20261015-082354.txt` on the drive.
+
+| Device · Android | Drive · when | On the phone | Host |
+|---|---|---|---|
+| OnePlus 7 · 16 | D1: EXT4 (plain) · 10-15 08:10–08:24 | write verify ALL PASSED (cached, cache dropped, remounted), 16 MiB at 0.82 MB/s; unaligned A+B PASS; correctness A–G ALL PASSED; **bigwrite 6.09 / 17.74**, ALL PASSED after remount (244 tree files); fixtures ALL 20854 MATCHED | D1EXT4 CLEAN: e2fsck -fn on `/dev/sda9` clean, 0.1% non-contiguous; matrix verify (08:58): fixtures 20854/20854, big.bin 2,200,000,000 B OK, tree 244/244 OK, 8 reports. **Drive 1: 1 of 10 NOT CLEAN — D1FAT32**, see below |
+
+Then the journal repair, on the same drive and phone, in two cycles, each one a
+Linux mount pulled out:
+
+| Device · Android | Drive · when | On the phone | Host |
+|---|---|---|---|
+| OnePlus 7 · 16 | D1EXT4 · 09:14, build `a2202be` | Mounted read-only with the repair dialog: **"3 journal transaction(s) replayed, 97 block(s) written. It is writable now."** Then `free,write,unaligned,correct`: write verify ALL PASSED (0.91 MB/s), unaligned A+B PASS, correctness A–G ALL PASSED | e2fsck exit 0, but "Free blocks count wrong (60314, counted=57259)", "Free inodes count wrong (337846, counted=337643)" — stale superblock totals from the pull, fixed in `83e318f` by recounting after the replay; "orphan_present is set but orphan file is clean" (a note, Linux clears it). All 202 files written before the pull matched their hashes |
+
+| OnePlus 7 · 16 | D1EXT4 · 09:59, build `87d26f2` | Dialog, then **"3 journal transaction(s) replayed, 79 block(s) written. It is writable now."** Then `free,write,unaligned,correct`: write verify ALL PASSED (0.91 MB/s), unaligned A+B PASS, correctness A–G ALL PASSED | e2fsck -fn clean with **no wrong totals**: the recount works. Only the orphan_present note remains. All 261 files written before the second pull matched, and so did the 91 first-cycle files left after its deletes |
+
+How the state was made: on the laptop, `udisksctl mount` of D1EXT4 (kernel ext4,
+no root), files written over two syncs, then the stick pulled without unmounting.
+Cycle 1 wrote 202 files into `BENCH/reports/journal_test/`: 12 blobs of 150 KB–1.8 MB,
+and 300 small files with 111 deleted, plus a rename. Cycle 2 wrote 261 into
+`journal_test2/` (10 blobs to 2.1 MB, 250 small files, a rename) and deleted 111
+from cycle 1's. Plugged into the OnePlus, the partition mounted read-only
+with `needs_recovery` and the dialog opened by itself.
+
+**D1FAT32, NOT CLEAN, from before the ext4 run.** fsck.fat: dirty bit set, the
+backup boot sector differs at offset 65 (01/00), FATs differ, and the free-cluster
+summary is off by one. This change does not touch FAT32, and today's run did not
+name it. When D1 was plugged into the OnePlus at 08:05, vold ran `fsck_msdos` on it,
+which it does before mounting a FAT volume itself; the app then claimed the drive
+and cut that mount off. It was last CLEAN on 10-10 (21:49). Not restored yet.
+
+What changed against the same drive, phone and section on earlier builds:
+
+| | bigwrite write MB/s | ext4 write commands per MiB |
+|---|---|---|
+| 10-07, `2a6fe4f` | 1.22 | not counted |
+| 10-10 (0.4.1 matrix) | 1.21 | not counted |
+| **10-15, `e32a6b3`** | **6.09** | **5.0** (10,532 for 2,127.7 MiB) |
+| FAT32 on D1, same phone, 10-07 / 10-10 | 8.01 / 7.73 | — |
+
+About 5× faster, and 76–79% of FAT32 on the same drive. FAT32 sets the practical
+ceiling: the same USB layer with no metadata of its own to write. Issue #36's target
+was ≥80% of the measured ceiling and never below FAT32. That target is close, but
+not met.
+
+The 64 KiB-chunk `write` section did not improve: 0.82 MB/s against 0.73–0.82 on
+earlier ext4 rows. A 64 KiB call now costs one data command plus the bitmap,
+descriptor, superblock count and inode, about 77 ms in all at ~15 ms per USB command.
+That fixed cost per call is what #36's phase 4 (a write-back window for metadata)
+would amortise, and it was left undone pending a decision, because it weakens the
+crash-safety guarantee #33 depends on.
+
+**Commit hashes after the merge of #61** (rebase-merge, so new hashes). The rows above,
+the PR and the commit messages cite the branch hashes:
+
+| On the branch (cited) | On `main` | Commit |
+|---|---|---|
+| `e32a6b3` | `c01036e` | ext4: write in runs from a goal block; repair a journal needing recovery |
+| `a2202be` | `11c37f0` | ext4 repair: replay block 0; offer the dialog from every mount path |
+| `83e318f` | `ae74882` | ext4 repair: recount free totals after a replay; s_free_blocks_hi at 0x158 |
+| `87d26f2` | `0058dd0` | docs: record the D1EXT4 ext4 run and the first on-device journal repair |
+| `3235849` | `150c17b` | docs: record the second on-device journal repair (87d26f2) |
+
+The tree of `150c17b` is identical to `3235849`, the commit the parallel E2E run (56/56)
+and CI passed on.
+
+## 2026-10-14 — PR #53, disconnected cards: no benchmark rows
+
+PR #53 (a drive that drops while mounted stays on screen as a DISCONNECTED card) changed no
+I/O path, so no benchmark ran and there are no rows. It was checked by hand on the OnePlus 7
+(Android 16) with the debug build of `29675dc`: Drive 5's plain exFAT partition 7 pulled
+from a powered hub and plugged back in; the record is in the PR description. Its E2E runs
+(`5452716`, 55/55) and the minified `disconnect` runs are recorded there as well.
+
+**Commit hashes after the merge of #53** (rebase-merge, so new hashes). The PR and the
+commit messages cite the branch hashes:
+
+| On the branch (cited) | On `main` | Commit |
+|---|---|---|
+| `d36a78b` | `2ac5d84` | feat(ui): a drive that drops stays on screen, with advice; help when a scan finds none |
+| `29675dc` | `4ed3fa8` | test(e2e): pull the drive out from under a mount, twice (disconnect case) |
+| `1c11590` | `03db824` | test(e2e): run the disconnect case from testMountUsbDrive, not its own @Test |
+| `44707e3` | `f57c67e` | store: add 6_disconnected, a drive's card after it was pulled while mounted |
+| `4d362a6` | `aaf1e3e` | test(e2e): keep OtgMasterState for the minified test APK |
+| `47bda5c` | `109e456` | test(e2e): keep MountedDrive.getSourceDeviceName for the minified test APK |
+| `5452716` | `48451c5` | test(e2e): find the history line again at the click, and scroll to its entries |
+
+## 2026-10-11 — 0.4.2 on `cafdf24`: VeraCrypt cascades and Argon2, Format and Encrypt (Drive 5)
+
+Drive 5 is stick `071C48F5FB0EF449` (TEST_DATA.md §16.6): six VeraCrypt volumes made by
+desktop VeraCrypt 1.26 — one per cipher/KDF shape the release adds — and four plain
+partitions for Format and Encrypt. The APK is `cafdf24` (the PR's code; the commits after
+it are tests, docs and screenshots), installed on the Pixel 7 Pro before the runs; every
+report's `build:` line says `0.4.2 (48) commit cafdf24`.
+
+**Scope, set by the user:** cipher and KDF correctness, not bulk transfer. Sections
+`free,block,dir,path,write,unaligned,correct` — no `seq`, `random`, `opens`, `bigwrite`,
+and no `fixtures` (it hashes the 2.1 GB `large/` files, at 0.07 MB/s through the USB-C
+multiport adapter the stick hung off: one p1 attempt spent 83 min there). Content
+correctness is `write verify` on all three passes, `unaligned` and `correctness`; the
+fixture trees were checked instead by the laptop's fsck after the run. Throughput figures
+are the adapter's, not the app's (0.07–8.45 MB/s on the same stick, minutes apart), and
+are not comparable with anything.
+
+| Device · Android | Partition · cipher / KDF / PIM · FS · start | On the phone | Host (20:16, `verify_volume.sh`) |
+|---|---|---|---|
+| Pixel 7 Pro · 17 | p1 · AES-Twofish-Serpent / Argon2 / default (416 MiB, 6 passes) · FAT32 · 17:34 | write verify ALL PASSED (3 passes), unaligned A+B PASS, correctness ALL PASSED | VeraCrypt opens it; vfat CLEAN |
+| Pixel 7 Pro · 17 | p2 · Serpent-Twofish-AES / Argon2 / 1 · exFAT · 18:04 | all PASSED | exfat CLEAN, 20,966 files |
+| Pixel 7 Pro · 17 | p3 · Twofish / SHA-512 / default · NTFS · 18:26 | all PASSED | ntfs CLEAN |
+| Pixel 7 Pro · 17 | p4 · AES-Twofish / Argon2 / 1 · exFAT · 18:28 | all PASSED | exfat CLEAN, 20,951 files |
+| Pixel 7 Pro · 17 | p5 · Serpent-AES / SHA-512 / 1 · FAT32 · 18:30 | all PASSED | vfat CLEAN |
+| Pixel 7 Pro · 17 | p6 · Twofish-Serpent / Argon2 / 31 (1 GiB, 13 passes) · exFAT · 18:49 | all PASSED (76 min; the KDF itself is ~1 min of it) | exfat CLEAN, 20,985 files |
+
+No PARTIAL, NOT VERIFIED or CONTAMINATED line in any of them.
+
+**Format and Encrypt through the UI**, 20:06–20:11, driven by tapping the app as a user
+would (the card's ⋮ menu, the confirmation screen checked to name the right partition,
+ERASE typed): all four quick, because at the 0.92 MB/s the link gave then a full 2 GiB
+overwrite would have taken ~40 min — full is covered by the E2E cases and host tests.
+
+| Partition · before | Action | On the phone | Host |
+|---|---|---|---|
+| p7 · plain exFAT, 0.3 GB of files | Format | "Formatted as exFAT and mounted", 4 s | exfat CLEAN, 0 files |
+| p8 · plain FAT32, 0.3 GB of files | Format, then Encrypt: Twofish / SHA-512 / default, FAT32 inside | 4 s, then "Encrypted (Twofish, SHA-512) with FAT32 inside, and mounted", 22 s | **desktop VeraCrypt opens the app-made volume**; vfat CLEAN |
+| p9 · plain FAT32, 0.3 GB of files | Encrypt: AES-Twofish-Serpent / Argon2 / default, exFAT inside | "Encrypted (AES-Twofish-Serpent, Argon2) with exFAT inside, and mounted", 57 s | **desktop VeraCrypt opens it**; exfat CLEAN, 0 files |
+
+p9 is the case no host tool could check before: cryptsetup has no Argon2 for VeraCrypt, so
+`VeraCryptVolumeCreatorTest` opens Argon2 volumes only with the app's own reader. Desktop
+VeraCrypt opening the app's Argon2 cascade volume is the independent check.
+
+**Commit hashes after the merge of #46** (rebase-merge, so new hashes). The rows here and
+the PR cite the branch hashes:
+
+| On the branch (cited here) | On `main` | Commit |
+|---|---|---|
+| `b6d779e` | `803a187` | feat: VeraCrypt cascades, Twofish and Argon2id header keys |
+| `d2b741e` | `1ef531a` | test(e2e): Twofish, cascade and Argon2 cases; a hash.txt per case |
+| `1be5522` | `9bbf103` | test(e2e): generate_testdata.sh fails on VeraCrypt 1.26; use a 20+ character password |
+| `f5f6188` | `3193ea1` | test(e2e): regenerated case files for the new password and cases |
+| `4714961` | `7ae83af` | build: R8 shrinking and obfuscation for the release build |
+| `241b903` | `dcb8356` | ui: edge-to-edge on every Android version, with insets handled |
+| `f182d29` | `d73b019` | test(e2e): the minified run never started a test; a dead runner counted as a pass |
+| `95f0e82` | `6f5c8bb` | feat: FAT32 and exFAT formatters, and VeraCrypt volume creation |
+| `70b95ec` | `cbd1e26` | feat(ui): More actions menu with Format and Encrypt; two-pane tablet layout |
+| `cafdf24` | `0a4dc4b` | store: 7" and 10" tablet screenshots for the two-pane layout and the More menu |
+| `d7265e5` | `d8c45f0` | test(e2e): keep the Kotlin standard library in the minified build type |
+| `32b3b2b` | `b6f5b86` | docs: Drive 5 runs on the Pixel — cascades, Argon2, Format and Encrypt; phone screenshots |
+
+### Not rows: runs that did not complete
+
+- **p1, 13:20 (`241b903`).** The phone was locked; the unlock waited 39 min for USB
+  permission and the benchmark gave up at its 600 s mount timeout. No result.
+- **p1, 14:00, and p2, 14:02 (`241b903`).** p1 lost the drive in its block-layer section
+  (`MAX_RECOVERY_ATTEMPTS Exceeded`) while the multiport adapter re-enumerated its own audio
+  and network interfaces; p2 then read at 0.09 MB/s and was stopped. No result.
+- **p1, 15:40 (`241b903`).** Passed write verify, unaligned and correctness and matched all
+  20,000 listing entries, then spent 83 min hashing the 2.1 GB fixture file and was stopped
+  when the scope dropped `fixtures`. Not a result; p1 was re-run on `cafdf24` (above).
+
+---
+
+## 2026-10-10 to 10-11 — 0.4.1 on `ae25575`, completing the matrix
+
+Every run here is `ae25575` (the release app code plus the per-partition report save; see
+the next section), the same sections and the same laptop check as there. Runs were
+driven one partition at a time by `matrix/helpers/sequence_runs.sh` unless a row says
+otherwise, so each partition has its own report.
+
+**The Drive 2 copy.** The Pixel 7 Pro's Drive 2 run used a second stick, serial
+`071C48F5FB0EF451`, written from the same Drive 2 build images with
+`write_matrix_drive.sh` and read back ALL CLEAN with **0 MiB changed against the build**
+before the run — a byte-for-byte Drive 2, so the M30 and the Pixel could run Drive 2 at
+once. (It had been the LUKS1+ext4 Drive B of `TEST_DATA.md` §10, which no longer exists.)
+
+**A queue bug, found and fixed during these runs.** `sequence_runs.sh` copied a run's
+`benchmark.txt` a fixed 60 s after its end line; on the Pixel's D2VCEXFAT the app took two
+minutes to write it, so the queue copied the previous partition's report (and its
+notification showed D2VCFAT32's figures). The run itself was complete: its own report,
+`otgbench-Pixel_7_Pro-20261010-164537.txt`, was pulled from the phone into its place, and
+the queue now waits for the app's "results written to" line. Every other report was
+checked to name its own partition.
+
+| Device · Android | Drive · when | On the phone | Host |
+|---|---|---|---|
+| Pixel 7 Pro · 17 | D1: FAT32, NTFS, EXT4, APFSECI, APFSECS, BLNTFS · 10-10 07:31 (one multi-partition run) | ro ×2 (fixtures ALL 21777 / 21911); FAT32 6.22 / 31.56, NTFS 3.03 / 37.12, EXT4 0.98 / 37.00, BLNTFS 2.72 / 27.08 — all PASSED | D1 ALL CLEAN (10:05) |
+| Pixel 7 Pro · 17 | D4, all 10 · 10-10 09:56 (one run) | ro ×8; D4BLFAT32 5.00 / 25.37, D4BLEXFAT 1.34 / 30.00 — all PASSED | D4 ALL CLEAN (11:32), D4BLEXFAT < 1 MiB |
+| Samsung M30 · 10 | D2: VCFAT32 · 10-10 08:37 | all PASSED, 3.40 / 7.52 | D2 ALL CLEAN (10:07, with the incomplete run below) |
+| Samsung M30 · 10 | D2: VCEXFAT 10:10, VCNTFS 11:41, VCEXT4 12:44, L1EXT4 14:34 | all PASSED: VCEXFAT 0.91 / 9.52, VCNTFS 1.88 / 10.48, VCEXT4 0.60 / 9.55, L1EXT4 0.59 / 8.24 | D2 ALL CLEAN (16:43), D2VCEXFAT < 1 MiB |
+| Pixel 7 Pro · 17 | D2 (the copy), all 10 · 10-10 15:43–21:51 | all PASSED: VCFAT32 5.97 / 23.21, VCEXFAT 1.17 / 27.18, VCNTFS 2.90 / 27.97, VCEXT4 0.89 / 26.82, L1FAT32 5.49 / 22.79, L1EXT4 0.90 / 26.77, L2EXFAT 1.31 / 27.24, L4EXT4 0.89 / 25.83, L4NTFS 2.74 / 26.06, BLFAT32 5.33 / 24.52 | ALL CLEAN (22:08), both exFAT < 1 MiB |
+| OnePlus 7 · 16 | D1, all 10 · 10-10 18:00–21:25 | ro ×4 (fixtures ALL 22129 / 22024 / 21777 / 21911); FAT32 7.73 / 26.01, EXFAT 1.76 / 39.80, NTFS 3.19 / 41.71, EXT4 1.21 / 40.16, BLNTFS 2.90 / 26.79, BLEXFAT 1.53 / 24.66 — all PASSED | D1 ALL CLEAN (21:49), both exFAT < 1 MiB |
+| Pixel 7 Pro · 17 | D1: APFSCS · 10-10 21:56 | ro, fixtures ALL 22024 — including `large/seq_2100m.bin`, whose read the 10-09 USB loss had cut | not re-read: APFS is read-only to the app, and the drive had been ALL CLEAN at 21:49 |
+| Samsung M30 · 10 | D2: L1FAT32 18:23, L2EXFAT 19:17, L4EXT4 20:46, L4NTFS 22:35 | all PASSED: L1FAT32 3.33 / 8.45, L2EXFAT 0.91 / 9.57, L4EXT4 0.60 / 9.72, L4NTFS 1.97 / 10.64 | D2 ALL CLEAN (10-11 06:15), D2L2EXFAT < 1 MiB |
+| OnePlus 7 · 16 | D3: L1EXFAT, L4EXFAT · 10-10 21:39–23:11 | all PASSED: L1EXFAT 1.57 / 24.31, L4EXFAT 1.25 / 22.80 | D3 ALL CLEAN (23:30), both exFAT < 1 MiB |
+
+No PARTIAL, NOT VERIFIED or CONTAMINATED line in any of them.
+
+### Not rows: runs that did not complete
+
+- **Samsung M30, Drive 2, 10-10 09:37.** The next partition after D2VCFAT32: D2VCEXFAT's log
+  stops at 09:53 in its correctness section after write verify and unaligned had passed. No
+  report. Drive 2 read back ALL CLEAN at 10:07, and D2VCEXFAT was run again at 10:10 (above).
+- **Samsung M30, Drive 2, D2BLFAT32, 10-10 23:38.** The queue started it, and the laptop
+  session driving the queue ended moments later and took the queue, its log capture and the
+  adb server with it; by morning the phone, left on battery, was off the network. The 10-11
+  read-back found D2BLFAT32 exactly as at 16:43 (4 reports, the earlier big file): it never
+  ran. So the M30's Drive 2 is 9 of 10 on the release; BitLocker + FAT32 is covered on this
+  phone by D4BLFAT32 (`ae25575`, 10-09).
+
+---
+
+## 2026-10-07 to 10-10 — the 0.4.1 release candidate, after the exFAT leak
+
+**Builds.** Four builds ran in this period. The app code is identical within each pair:
+- `2a6fe4f` and `8655eeb`: the PR #31 release candidate (2a6fe4f only adds the 10-07 run
+  records);
+- `cfc9a64`: + the benchmark harness fix (wait for unlocks still in progress; count the
+  previous tree as free space). Debug benchmark code only;
+- `a5f10ae`: + the exFAT delete-leak fix (`deleteNode` frees the clusters at unlink);
+- `ae25575`: + the benchmark saving `benchmark-in-progress.txt` after every partition.
+  Debug benchmark code only — the app is the same as `a5f10ae`.
+
+**Commit hashes after the merge of #37** (rebase-merge, so new hashes):
+
+| On the branch (cited below) | On `main` | Commit |
+|---|---|---|
+| `cfc9a64` | `eecf254` | bench: wait for unlocks still in progress; count the deleted tree as free |
+| `a5f10ae` | `d330a32` | fix: exFAT deletes did not free the file's space |
+| `ae25575` | `e5f76bb` | bench: save the report so far after every partition (PR #39) |
+| `2814a8d` | `584c1f2` | verify: fail exFAT volumes holding clusters no file owns (PR #39) |
+
+**Sections, every row:** `free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true. **Host** is the laptop read-back checked with
+`verify_matrix_drive.py`: each filesystem's own checker, the build baselines, every `bigwrite`
+file against its recipe, and — from 2026-10-08 on, branch `verify/exfat-unowned-clusters` —
+**exFAT space no file owns** (statvfs used − du > 1 MiB fails). `fsck.exfat` 1.3.2 does not
+report that, which is how the leak below passed every earlier check.
+
+### The exFAT leak, and its fix on hardware
+
+On the old code a delete only freed a file's clusters once every handle on its node had been
+released — by `close()`, or by the GC for the handles a listing hands out; an unmount first
+lost them for good. Fixed in `a5f10ae` (PR #37). Laptop measurements, statvfs used − du:
+
+| Partition | Old code (2a6fe4f / cfc9a64) | Fixed (a5f10ae / ae25575) |
+|---|---|---|
+| D1EXFAT | **101 MiB** (OnePlus 7) | 188,416 B — identical to the freshly built image (bitmap + upcase table); Pixel 7 Pro and M30 |
+| D1BLEXFAT | — | < 1 MiB (Pixel, M30) |
+| D2VCEXFAT | — | < 1 MiB (OnePlus) |
+| D2L2EXFAT | **67 MiB**, left by the 10-07 M30 runs | still 67 MiB after the OnePlus `a5f10ae` run — no new leak; then restored |
+| D3L1EXFAT | **98 MiB** (Pixel) | < 1 MiB (Pixel, M30) |
+| D3L4EXFAT | **2190 MiB**: the deleted 2.2 GB file; the next bigwrite hit ENOSPC at 459 MB (Pixel) | < 1 MiB, full 2.2 GB written (Pixel, M30) |
+| D4BLEXFAT | **60 MiB** from one run on a clean partition (Pixel) | < 1 MiB (OnePlus, M30) |
+
+Every old-code row was `fsck.exfat`-clean.
+
+### Completed runs
+
+Write / read-after-remount are the 2.2 GB `big.bin` figures in MB/s. "ro" = ext2/ext3/APFS,
+write sections SKIPPED by design. Every fixture set listed matched (ALL n MATCHED).
+
+| Device · Android | Drive · build · when | On the phone | Host |
+|---|---|---|---|
+| Huawei P20 Lite · 9 | D4: D4L1EXT2, D4VCEXT3, D4BLFAT32 · `8655eeb` · 10-07 10:58 | ro ×2; D4BLFAT32 all PASSED, 2.85 / 4.64 | D4 CLEAN (with the next row) |
+| Huawei P20 Lite · 9 | D4: L1EXT3, L2EXT2, L2EXT3, L4EXT2, L4EXT3, VCEXT2 · `8655eeb` · 10-07 19:08 | ro ×6, fixtures ALL | D4 ALL CLEAN (10-08 00:08) |
+| Pixel 7 Pro · 17 | D3: EXT2, EXT3, L1EXFAT, L1NTFS, L2FAT32, L2NTFS, L2EXT4, L4FAT32 · `2a6fe4f` · 10-07 19:01 | ro ×2; D3L1EXFAT tree PASSED but **big file SKIPPED** (free-space estimate, fixed in cfc9a64 — the leak was already eating its space); others all PASSED: L1NTFS 2.72 / 24.61, L2FAT32 5.43 / 17.97, L2NTFS 2.69 / 24.94, L2EXT4 0.85 / 26.63, L4FAT32 2.90 / 24.55 | fsck CLEAN; leak check later: **D3L1EXFAT 98 MiB FAILED** |
+| Pixel 7 Pro · 17 | D3: L4EXFAT, BLNTFS · `cfc9a64` · 10-08 00:10 | **D3L4EXFAT bigwrite FAILED**: `exFAT write failed at offset 458938459` (ENOSPC — the leak); D3BLNTFS all PASSED, 2.66 / 27.18 | fsck CLEAN; leak check: **D3L4EXFAT 2190 MiB FAILED** |
+| OnePlus 7 · 16 | D1, all 11 · `2a6fe4f` · 10-07 23:30 | EFI block reads only; APFS ×4 ro; FAT32 8.01 / 24.37; EXFAT 0.88 / 40.04; NTFS 3.11 / 47.66; EXT4 1.22 / 44.10; BLNTFS 3.04 / 28.76 — all PASSED; **D1BLEXFAT big file SKIPPED** (the M30's earlier run had left its 2.3 GB; free-space estimate) | 10 of 10 CLEAN; **D1EXFAT 101 MiB unowned** (measured by hand, df − du, before the leak check existed) |
+| Pixel 7 Pro · 17 | D4, all 10 · `cfc9a64` · 10-08 07:37 | ro ×8; D4BLFAT32 5.10 / 23.31, D4BLEXFAT 1.18 / 29.03, all PASSED | 9 of 10: **D4BLEXFAT 60 MiB FAILED** (old code; partition was clean before the run) |
+| OnePlus 7 · 16 | D2, all 10 · `a5f10ae` · 10-08 07:59 | all PASSED: VCFAT32 6.42 / 21.00, VCEXFAT 1.58 / 24.20, VCNTFS 2.85 / 26.02, VCEXT4 1.09 / 24.03, L1FAT32 5.95 / 19.89, L1EXT4 1.08 / 24.02, L2EXFAT 1.55 / 23.97, L4EXT4 1.08 / 24.13, L4NTFS 3.05 / 26.25, BLFAT32 5.90 / 22.15 | 9 of 10: D2L2EXFAT 67 MiB — the M30's, unchanged; D2VCEXFAT < 1 MiB |
+| Pixel 7 Pro · 17 | D1: EXFAT, BLEXFAT · `a5f10ae` · 10-08 09:07 | all PASSED: 1.46 / 39.46, 1.10 / 29.00 | ALL CLEAN; D1EXFAT 188,416 B (= fresh) |
+| Pixel 7 Pro · 17 | D3: L1EXFAT, L4EXFAT · `a5f10ae` · 10-08 10:54 | all PASSED: 1.14 / 27.88, 0.90 / 27.25 (L4EXFAT's full 2.2 GB this time) | ALL CLEAN, < 1 MiB each |
+| OnePlus 7 · 16 | D4: BLEXFAT · `a5f10ae` · 10-08 18:49 | all PASSED, 1.58 / 25.05 | ALL CLEAN, < 1 MiB |
+| Samsung M30 · 10 | D1, the 10 fixture partitions · `a5f10ae` · 10-08 18:38 | ro ×4; FAT32 4.59 / 10.02, EXFAT 1.21 / 12.34 (0.33 on 8655eeb), NTFS 2.22 / 16.40, EXT4 0.83 / 15.92, BLNTFS 1.96 / 12.09, BLEXFAT 0.88 / 9.92 — all PASSED | 9 of 10: **D1FAT32 FAILED — Samsung mounted it** (below); both exFAT < 1 MiB |
+| Samsung M30 · 10 | D3: 8 writable · `ae25575` · 10-09 08:19 | all PASSED: L1EXFAT 0.89 / 9.52, L1NTFS 1.97 / 10.89, L2FAT32 3.39 / 8.32, L2NTFS 1.90 / 11.12, L2EXT4 0.59 / 10.00, L4FAT32 2.10 / 8.48, L4EXFAT 0.68 / 10.04, BLNTFS 1.92 / 12.39 | ALL CLEAN, both exFAT < 1 MiB. D3EXT2/EXT3 ran on `a5f10ae` 10-09 00:18–00:28 (fixtures ALL 21821 / 21883) in the interrupted run below |
+| Samsung M30 · 10 | D4, all 10 · `ae25575` · 10-09 19:24 | ro ×8; D4BLFAT32 3.45 / 8.45, D4BLEXFAT 0.94 / 10.87, all PASSED | ALL CLEAN, D4BLEXFAT < 1 MiB |
+
+No PARTIAL, NOT VERIFIED or CONTAMINATED line in any of them.
+
+**D1FAT32 on the M30 (`a5f10ae`), host FAILED.** The same signature as the 10-07 M30 run:
+FAT32 dirty flag set (boot sector offset 65 = 01, backup 00) and the free count one cluster off.
+Only a kernel FAT driver writes offset 65; libaums never touches it. All 20,995 fixtures, the
+2.2 GB file and the 240-file tree verify. It happened when the run ended and the drive was
+pulled; Drives 3 and 4, unplugged later while the app still held the stick, came back clean.
+D1FAT32 was restored. Recorded as Android's mount, not the app's writes.
+
+### Not rows: runs that did not complete
+
+- **Samsung M30, Drive 2, attempts 2–4.** `8655eeb` 10-07 17:48 and 20:24; `ae25575` 10-09 23:04.
+  Each died on `MAX_RECOVERY_ATTEMPTS` with the transfer already stepped down to 16 KiB:
+  attempt 2 in D2VCEXT4's bigwrite (block 43,107,840), attempt 3 in D2VCEXT4 (43,794,176),
+  attempt 4 in D2VCFAT32's fixture hashing (2,643,624) after its writes had passed (3.96 / 7.34).
+  The same M30 ran Drives 1, 3 and 4 for hours without a drop, and the OnePlus ran all of
+  Drive 2; this stick and this phone do not hold a link. After attempt 3 the laptop found
+  D2VCEXT4 failing e2fsck ("end of extent exceeds allowed value" plus block-bitmap
+  differences — the shape an interrupted ext4 write leaves) and D2VCEXFAT failing its checks;
+  both were restored. After attempt 4, Drive 2 was ALL CLEAN.
+- **Pixel 7 Pro, Drive 2, `a5f10ae`, 10-08.** 18:32: the drive vanished before the first mount
+  ("no probed candidates"). 20:14: the powered hub dropped — every device on it detached in the
+  same millisecond — two minutes into D2VCFAT32's write test. D2VCFAT32 came back with 2080
+  orphaned clusters and a wrong FSInfo count (an interrupted FAT32 write; no journal); restored.
+- **Pixel 7 Pro, Drive 1 (8 partitions), `a5f10ae`, 10-09 01:12.** USB lost at 01:26 (direct
+  adapter): EFI and D1APFSCI done (fixtures ALL 22129), D1APFSCS fixtures failed mid-read, D1FAT32
+  unreadable, the rest skipped. Nothing written. Drive 1 CLEAN afterwards.
+- **Samsung M30, Drive 3, `a5f10ae`, 10-09 00:18.** Running slowly but alive; it was unplugged
+  around 07:10 on a wrong call that it had died (logcat had gone quiet and a debugger thread
+  dump missed the benchmark thread). Its report was never written; D3EXT2/EXT3 results come
+  from logcat. Drive 3 CLEAN afterwards. The per-partition save (`ae25575`) exists because of it.
+- **Pixel 7 Pro, Drive 4, `2a6fe4f`, 10-07 23:46:** no drive attached; empty report.
+- **Huawei P20 Lite, D4BLEXFAT, `8655eeb`, 10-07 20:31:** battery ran out mid-partition.
+
+---
+
+## 2026-10-07 — the 0.4.1 release candidate, `8655eeb`
+
+**Commit hashes after the merge of #31.** The runs, `VENDOR_FIXES.md`, the issues and
+PR #31 cite the hashes that `feature/apfs` and `fix/*` had when they were built and
+run. `main` requires linear history, so #31 was rebase-merged and every commit
+was given a new hash. Same order, same subjects:
+
+| On the branch (cited) | On `main` | Commit |
+|---|---|---|
+| `048d8bc` | `560b2aa` | testdata: verify the Mac APFS images on Linux, 4 of 4 |
+| `e077386` | `ac1e0ba` | vendor: libfsapfs f63c83b (20260921) and 16 libyal libraries |
+| `5b3aee3` | `941cdd9` | feat: read APFS drives, plain and encrypted, case-sensitive or not |
+| `93db7a4` | `5d28a43` | e2e: a plain drive has no Unmount button; check that instead of clicking it |
+| `af5cc72` | `5b4b0b1` | e2e: 47/47 with the four APFS cases, on 9e958fd |
+| `45cf743` | `eae6f78` | docs: README lists NTFS, BitLocker and APFS as supported |
+| `d6ef7f6` | `7ba40e8` | licence: move the project from GPL-2.0-or-later to GPL-3.0-or-later |
+| `808ca5f` | `304fc37` | bench: wait for every unlock to finish, not for the mount count to go quiet |
+| `377682f` | `601e558` | bench: write sections report SKIPPED, not FAILED, on a read-only volume |
+| `548156f` | `1536480` | exfat: report the volume's own label, not "exFAT" for every volume |
+| `ef6d88b` | `9e7bfb5` | bench, app: remounts keep the USB connection; writes mount read-write |
+| `afb6e1c` | `3a73144` | bench: bigwrite — a 2.2 GB file and a churned tree, checked by the host |
+| `9704489` | `0b0ffd2` | bench, exfat: bigwrite fixes from its first emulator runs; remounts wait for unlocks |
+| `354a0c0` | `e40a7bf` | docs: record the first device-matrix run (OnePlus 7, d9594a9) |
+| `81d16cc` | `b13bead` | docs: record device-matrix run 2 (OnePlus 7, 904e1da) |
+| `ff432b7` | `3fff007` | bench: prove a remount by filesystem object, not by mount id |
+| `1327be0` | `214ea61` | fix: unmounting an encrypted APFS volume closed the whole USB stick |
+| `299214e` | `3f356a9` | bench, app: re-probe a listed drive whose plain partitions were dropped |
+| `6afc729` | `1d2d025` | bench: bigwrite runs only through a live mount |
+| `9d1651d` | `1384482` | bench, app: remount only after every unmount's bookkeeping has finished |
+| `84459aa` | `8af1df1` | libaums: FAT32 allocation wraps at the last data cluster (V14) |
+| `c2242b8` | `eafff62` | docs: map the device-matrix runs' commits across the rebase onto main |
+| `952a474` | `ac81d7d` | docs, store: bring the listing and the site up to NTFS, BitLocker and APFS |
+| `8ac715b` | `3e6d791` | fix: decrypted volumes refuse reads and writes past their own end |
+| `5677881` | `9dee17a` | matrix: the verifier survives, and diagnoses, a damaged VeraCrypt header |
+| `d25a179` | `b80d1a2` | matrix: write_matrix_drive.sh rewrites existing partitions in place |
+| `23480de` | `adabcc9` | matrix: the verifier finds apfs-fuse and apfsck in matrix/tools by itself |
+| `d784c40` | `bffad4b` | docs: record matrix runs 3-6 and the host check that followed them |
+| `5f9bf9a` | `8a52dad` | fix: FAT32 moves left duplicate short names; empty files held a cluster |
+| `0fda879` | `ee1aa45` | matrix: write_matrix_drive.sh --only no longer exits silently |
+| `626699e` | `06a5e05` | matrix: verify --only takes a comma list and refuses unknown labels |
+| `778dc07` | `080e0fc` | fix: a GC in the middle of a FAT32 listing threw NullPointerException |
+| `d004775` | `2adb17d` | changelog: FAT32 folders could fail to open (V17) |
+| `fd054df` | `cc2ca6f` | docs: record matrix run 8 — FAT32 partitions fsck-clean after the tree |
+| `96c7843` | `266b725` | docs: record matrix run 9 — FAT32 clean on the V17 build |
+| `f3bc53a` | `2c271cf` | fix: FAT32 volumes under 32 MiB refused every write as "volume full" |
+| `c4f706b` | `f576a4c` | fix: drives that reject 120 KiB transfers now open (issue #29) |
+| `bddc43a` | `f8fa90b` | feat: say why no USB device is listed, not just "Found 0 USB devices" |
+| `746e108` | `6494db8` | docs: all four matrix drives built; which stick is which |
+| `ed59669` | `0016d2e` | fix: ext4 deletes unlink before freeing, a block group at a time (#33) |
+| `8b21b1e` | `5090611` | fix: Android 10 reported mounted drives as failed and forgot their passwords |
+| `8655eeb` | `aa6d83f` | bench: write only to prepared fixture volumes, and never create BENCH/ |
+| `2a6fe4f` | `c397743` | docs: record the 0.4.1 release-candidate runs on 8655eeb |
+
+Both runs below used the same build, `8655eeb`: E2E 47/47 on it. Sections:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true, every partition of the drives attached. Android's
+volumes were unmounted before each run (`sm unmount`). Each drive was read back on
+the laptop afterwards and checked with `verify_matrix_drive.py`, which runs each
+filesystem's own checker, compares against the build baselines, and verifies every
+`bigwrite` file against its recipe.
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · commit 8655eeb — device-matrix Drives 3 + 4
+
+The first run on Drives 3 and 4: 2026-10-06 23:51:23 to 2026-10-07 07:50:21. The
+phone charged through the hub throughout (34% → 48%).
+
+| Partition | Container / FS | On the phone | big.bin write / read after remount (MB/s) | Host |
+|---|---|---|---|---|
+| D3EXT2, D3EXT3 | plain ext2 / ext3 | write sections SKIPPED (read-only by design); fixtures ALL 21821 / 21883 | — | CLEAN, 0 MiB changed |
+| D3L1EXFAT | LUKS1 exFAT | write verify, unaligned A+B, correctness A–G, bigwrite ALL PASSED; fixtures ALL 20929 | 0.72 / 22.92 | CLEAN |
+| D3L1NTFS | LUKS1 NTFS | all PASSED; fixtures ALL 20920 | 3.22 / 26.79 | CLEAN |
+| D3L2FAT32 | LUKS2 FAT32 | all PASSED; fixtures ALL 20913 | 6.73 / 17.84 | CLEAN, fsck.fat clean |
+| D3L2NTFS | LUKS2 NTFS | all PASSED; fixtures ALL 20925 | 3.09 / 26.15 | CLEAN |
+| D3L2EXT4 | LUKS2 ext4 | all PASSED; fixtures ALL 20939 | 1.11 / 24.65 | CLEAN, e2fsck clean |
+| D3L4FAT32 | LUKS2 4K FAT32 | all PASSED; fixtures ALL 20972 | 3.81 / 17.95 | CLEAN |
+| D3L4EXFAT | LUKS2 4K exFAT | all PASSED; fixtures ALL 20910 | 0.53 / 23.94 | CLEAN |
+| D3BLNTFS | BitLocker CBC-256 NTFS | all PASSED; fixtures ALL 21023 | 3.12 / 29.28 | CLEAN |
+| D4{L1,L2,L4,VC}EXT{2,3} (8) | ext2/ext3 in LUKS1, LUKS2, LUKS2 4K, VeraCrypt | write sections SKIPPED (read-only by design); fixtures ALL, 21678–21971 each | — | CLEAN, 0 MiB changed |
+| D4BLFAT32 | BitLocker XTS-256 FAT32 | all PASSED; fixtures ALL 20918 | 6.23 / 17.08 | CLEAN |
+| D4BLEXFAT | BitLocker CBC-128 exFAT | all PASSED; fixtures ALL 21073 | 0.73 / 24.98 | CLEAN |
+
+No FAILED, PARTIAL, NOT VERIFIED or CONTAMINATED line. **Host: 20 of 20 CLEAN.**
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · commit 8655eeb — device-matrix Drive 1
+
+The second device in the matrix, and the first on Android 10: 2026-10-06 23:43:06
+to 2026-10-07 07:57:14. The M30 charged through its hub throughout (100%). All 11
+partitions attached, both BitLocker ones included. That they attached is the fix
+`8b21b1e` at work; see the note below.
+
+| Partition | Container / FS | On the phone | big.bin write / read after remount (MB/s) | Host |
+|---|---|---|---|---|
+| EFI | plain FAT32 (macOS's) | "BENCH/MANIFEST.txt not found — block reads only, nothing written" (`8655eeb`) | — | not checked (not a fixture volume) |
+| D1APFSCI, D1APFSCS, D1APFSECI, D1APFSECS | APFS | write sections SKIPPED (read-only); fixtures ALL 22129 / 22024 / 21777 / 21911 | — | CLEAN, 0 MiB changed |
+| D1FAT32 | plain FAT32 | all PASSED; fixtures ALL 20995 | 4.36 / 12.25 | **FAILED: Android's mount, not the app's writes** (below) |
+| D1EXFAT | plain exFAT | all PASSED; fixtures ALL 20963 | 0.33 / 15.64 | CLEAN |
+| D1NTFS | plain NTFS | all PASSED; fixtures ALL 21052 | 2.19 / 16.70 | CLEAN |
+| D1EXT4 | plain ext4 | all PASSED; fixtures ALL 20854 | 0.82 / 14.17 | CLEAN, e2fsck clean |
+| D1BLNTFS | BitLocker XTS-128 NTFS | all PASSED; fixtures ALL 20905 | 2.03 / 12.17 | CLEAN |
+| D1BLEXFAT | BitLocker XTS-256 exFAT | all PASSED; fixtures ALL 20898 | 0.26 / 9.48 | CLEAN |
+
+No FAILED, PARTIAL, NOT VERIFIED or CONTAMINATED line on the phone, and no "Max
+number of dynamic shortcuts" in logcat.
+
+**D1FAT32, host FAILED.** fsck.fat reported:
+- the dirty bit set, and the boot sector differing from its backup at offset 65
+  (that same flag);
+- "Free cluster summary wrong (83599 vs. really 83594)";
+- one unexplained file, `Android/data/.nomedia`.
+
+The directory entries date it: `LOST.DIR`, `Android/data/.nomedia` and
+`Android/data/com.samsung.android.app.simplesharing` were all created 2026-10-06
+23:35:30–34. That was when Drive 1 was plugged in, a minute before the first run
+started. Samsung's Android mounted the partition and created those, and the app then
+claimed the stick from under it (`force=true`), so the volume was never unmounted.
+Every file the app wrote from 00:17 on is intact: big.bin and all 240 tree files
+match. No duplicate directory entry, and no empty file holding a cluster: V15 and
+V16 hold on this device too. This is the takeover of an OS-mounted drive, deferred
+since runs 1–2, not a regression in this release.
+
+**#33 on hardware.** D1EXT4 still held run 7's 2.2 GB big.bin. The bigwrite step
+began at 03:13:18 and the new file finished writing at 03:56:28.8 after 2564 s, so
+deleting the old file and tree took about 26 s. The same delete was still running
+after 77 minutes on the Huawei before the fix. e2fsck is clean afterwards.
+
+Throughput on the M30 is roughly a third of the OnePlus's for the same container and
+filesystem. exFAT and software BitLocker are the slowest. That is a figure, not a
+fault.
+
+**Before this run, on `ed59669`.** The first M30 attempt found two bugs, and was
+stopped once they were understood:
+- On Android 10, a share shortcut threw "Max number of dynamic shortcuts exceeded"
+  after about the fourth mount. In attemptUnlock's catch that reported a mounted
+  drive as failed, deleted its saved password, and ran onComplete twice, so the
+  run started without the BitLocker partitions. Fixed in `8b21b1e`.
+- The benchmark wrote to the Mac's EFI partition, because run 7's report writer had
+  created `BENCH/` there. Fixed in `8655eeb`.
+
+That attempt left no complete report and is not a row.
+
+### OnePlus 7 · Android 16 · commit 8655eeb — V18 on a 30 MiB FAT32 SD card
+
+FAT32 under 32 MiB, the layout V18 fixes: `TotSec16 = 61440`, `TotSec32 = 0`,
+60462 clusters. Drive D's SD card was repartitioned for it, which erased the old
+drive D volumes, and the image was built by `mkfs.vfat` on the host with
+`BENCH/MANIFEST.txt` added. Sections `free,block,dir,write,unaligned,correct,fixtures`.
+- **On the phone:** capacity 30 MiB (upstream libaums read 0); write verify 16 MiB
+  ALL PASSED across a remount; unaligned A+B PASS; correctness A–F ALL PASSED (G
+  skipped, no large file on this volume). Before V18 every write here failed
+  "FAT32 volume is full".
+- **Host:** `fsck.fat -n` clean, apart from the warning every FAT32 this small gets,
+  which the fresh image also got. Dirty flag clear, layout unchanged.
+
+### Not rows: two runs that did not complete
+
+- **Samsung M30, Drive 2, `8655eeb`, 2026-10-07 08:3x–10:54.** D2VCFAT32 passed
+  everything (fixtures ALL 20958). Then at 10:54:30 the M30 lost its whole USB hub
+  (VMM7100), the stick and the hub's LAN port in one event, partway through
+  D2VCEXFAT's 2.2 GB write. libaums failed with `MAX_RECOVERY_ATTEMPTS`. The drive
+  stopped responding, so there is no result. D2VCEXFAT must be checked before its
+  next use.
+- **Huawei P20 Lite, Drive 2, `96c7843`, 2026-10-05/06.** Stopped at 9% battery
+  while deleting a 2.2 GB file on D2L1EXT4. That run found #33.
+
+## 2026-10-05
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit fd054df — device-matrix FAT32 partitions, run 9
+
+The four FAT32 partitions again, on the build with V17 (the listing GC race), as
+they were left by run 8 (host-verified CLEAN). Sections:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true, `--es drive D1FAT32,D2VCFAT32,D2L1FAT32,D2BLFAT32`.
+Started 19:37:04, ended 20:44:58. Android's volumes unmounted before, none mounted
+after; USB power, battery 100%.
+
+| Partition | Container | On the phone | big.bin write / read after remount (MB/s) | Host |
+|---|---|---|---|---|
+| D1FAT32 | plain | dense opens 50+50; write verify, unaligned A+B, correctness A–G, bigwrite (240 tree files) ALL PASSED; fixtures ALL 20995 | 8.27 / 27.15 | **CLEAN**, fsck.fat clean, 240/240 |
+| D2VCFAT32 | VeraCrypt | all PASSED (245); fixtures ALL 20958 | 6.30 / 18.80 | **CLEAN**, 245/245 |
+| D2L1FAT32 | LUKS1 | all PASSED (250); fixtures ALL 20953 | 6.41 / 18.49 | **CLEAN**, 250/250 |
+| D2BLFAT32 | BitLocker | **dense opens 50+50 (FAILED in run 8)**; all PASSED (246); fixtures ALL 20974 | 6.37 / 20.39 | **CLEAN**, 246/246 |
+
+No FAILED, PARTIAL, NOT VERIFIED or CONTAMINATED line, and no "exceeds" or FATAL
+EXCEPTION in logcat. All 20 partitions were host-verified CLEAN afterwards; the 16
+others still hold run 7's files.
+
+The race was intermittent, so a clean run cannot prove V17 on its own:
+`Fat32ListGcRaceTest` does that on the host. What this run shows is that the build
+passes on hardware the step that failed on it in run 8. It is also the second
+consecutive fsck-clean `bigwrite` tree on all four FAT32 partitions (V15, V16).
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit 626699e — device-matrix FAT32 partitions, run 8
+
+Re-run of the four FAT32 partitions on the build with V15 and V16 (`5f9bf9a`). They
+were first restored from their build images (`write_matrix_drive.sh --only`), and
+the host verified them CLEAN at 0 MiB changed. The other 16 were left as run 7
+left them, and verified unchanged by the restore. Sections:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true, `--es drive D1FAT32,D2VCFAT32,D2L1FAT32,D2BLFAT32`.
+Started 17:49:21, ended 18:56:36. Android's volumes unmounted before, none mounted
+after; USB power, battery 100%.
+
+| Partition | Container | On the phone | big.bin write / read after remount (MB/s) | Host |
+|---|---|---|---|---|
+| D1FAT32 | plain | write verify, unaligned A+B, correctness A–G, bigwrite (240 tree files) ALL PASSED; fixtures ALL 20995 | 7.12 / 23.97 | **CLEAN**: fsck.fat clean, big.bin + 240/240 tree OK |
+| D2VCFAT32 | VeraCrypt | all PASSED (245 tree files); fixtures ALL 20958 | 7.07 / 17.30 | **CLEAN**, 245/245 |
+| D2L1FAT32 | LUKS1 | all PASSED (250 tree files); fixtures ALL 20953 | 6.27 / 17.71 | **CLEAN**, 250/250 |
+| D2BLFAT32 | BitLocker | **dense opens FAILED `java.lang.NullPointerException`**; everything else PASSED (246 tree files); fixtures ALL 20974 | 6.66 / 19.33 | **CLEAN**, 246/246 |
+
+**V15 and V16 hold on hardware.** The same tree that left duplicate entries and a
+cluster-holding empty file on all four in run 7 is fsck-clean on all four. The host
+check covered all 20 partitions: the 16 others are CLEAN, still holding run 7's
+files.
+
+**The dense-opens failure** is V17 (`778dc07`). libaums' `listFiles` read its weak
+handle cache twice, and a GC between the reads made the second null. It came right
+after 2.1 GB of sequential reads. The harness logged only the exception's message,
+so the cause was found afterwards: the race was reproduced on the host by
+`Fat32ListGcRaceTest`. This build does not contain V17, so the failure stands as
+recorded.
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit 23480de — device-matrix Drives 1 + 2, run 7
+
+The first run on the restored drives, and the first with the FAT32 allocation bound
+(V14) and the decrypted-device bounds. Sections:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true, all partitions. Started 2026-10-04 16:42:32 and ended
+04:05:03, 11 h 23 min. All 21 attached. Android's volumes were unmounted with
+`sm unmount` before the start, and none were mounted at the end. Screen interactive
+throughout.
+
+**On the phone: every section passed on every partition.** No FAILED, PARTIAL, NOT
+VERIFIED or CONTAMINATED line; no "exceeds" or FATAL EXCEPTION in logcat.
+
+| Partition | Container / FS | On the phone | big.bin write / read after remount (MB/s) |
+|---|---|---|---|
+| EFI | plain FAT32 (macOS's) | block reads only | — |
+| D1APFSCI, D1APFSCS, D1APFSECI, D1APFSECS | APFS, plain and encrypted | write sections SKIPPED (read-only); fixtures ALL 22129 / 22024 / 21777 / 21911 MATCHED | — |
+| D1EXFAT | plain exFAT | write verify, unaligned A+B, correctness A–G, bigwrite ALL PASSED; fixtures ALL 20963 | 0.78 / 37.13 |
+| D1FAT32 | plain FAT32 | all PASSED; fixtures ALL 20995 | 8.45 / 25.66 |
+| D1NTFS | plain NTFS | all PASSED; fixtures ALL 21052 | 3.52 / 47.71 |
+| D1EXT4 | plain ext4 | all PASSED; fixtures ALL 20854 | 1.21 / 44.34 |
+| D1BLNTFS | BitLocker NTFS | all PASSED; fixtures ALL 20905 | 3.21 / 29.31 |
+| D1BLEXFAT | BitLocker exFAT | all PASSED; fixtures ALL 20898 | 0.71 / 24.56 |
+| D2VCFAT32 | VeraCrypt FAT32 | all PASSED; fixtures ALL 20958 | 7.11 / 17.34 |
+| D2VCEXFAT | VeraCrypt exFAT | all PASSED; fixtures ALL 20974 | 0.72 / 24.14 |
+| D2VCNTFS | VeraCrypt NTFS | all PASSED; fixtures ALL 20919 | 3.07 / 26.49 |
+| D2VCEXT4 | VeraCrypt ext4 | all PASSED; fixtures ALL 21071 | 1.10 / 25.38 |
+| D2L1FAT32 | LUKS1 FAT32 | all PASSED; fixtures ALL 20953 | 6.38 / 17.65 |
+| D2L1EXT4 | LUKS1 ext4 | all PASSED; fixtures ALL 21024 | 1.09 / 25.39 |
+| D2L2EXFAT | LUKS2 exFAT | all PASSED; fixtures ALL 20942 | 0.72 / 24.46 |
+| D2L4EXT4 | LUKS2 4K ext4 | all PASSED; fixtures ALL 20888 | 1.08 / 25.51 |
+| D2L4NTFS | LUKS2 4K NTFS | all PASSED; fixtures ALL 20927 | 3.14 / 26.70 |
+| D2BLFAT32 | BitLocker FAT32 | all PASSED; fixtures ALL 20974 | 6.67 / 19.09 |
+
+**Host verification** (`read_matrix_drive.sh`, then `verify_matrix_drive.py` against
+the build baselines): **16 of 20 CLEAN, all four FAT32 partitions FAILED fsck.fat.**
+
+- The 16 others: checker clean (apfsck, fsck.exfat, ntfs_check + ntfsfix, e2fsck -fn),
+  every read-set file matching, and every `bigwrite` file — big.bin 2,200,000,000 B
+  and the 240–250 tree files — matching its keystream recipe.
+- D1FAT32, D2VCFAT32, D2L1FAT32, D2BLFAT32: read set intact, big.bin and every tree
+  file matching, **and fsck.fat failing** with "Duplicate directory entry" in
+  `BENCH_TREE` on all four. D1FAT32 and D2BLFAT32 also have the tree's empty `f0.bin`
+  holding a cluster, "File size is 0 bytes, cluster chain length is > 0 bytes", with
+  the free count off by one.
+
+Both are libaums bugs, now V15 and V16 in `VENDOR_FIXES.md`:
+- V15: a move kept the short name from the file's old directory, where it was unique.
+- V16: a new file was given a cluster before it was ever written.
+
+The V14 overrun and the cross-partition writes did not recur. Contents were right
+everywhere, so only the filesystem's own checker could see this: the case `AGENTS.md`
+describes. `Fat32MoveFsckTest` reproduces both bugs (and a third, a moved directory's
+stale `..`) on the old code.
+
+## 2026-10-04
+
+### Device-matrix Drives 1 + 2 — host verification after runs 3–6, and restore
+
+Read back on the laptop after run 6 (`scripts/read_matrix_drive.sh`, then
+`scripts/verify_matrix_drive.py` against the build baselines). The state is
+cumulative over runs 3–6, since the drives were not moved between them.
+
+| Partition | Checker | Result |
+|---|---|---|
+| D1APFSCI, D1APFSCS, D1APFSECI, D1APFSECS | apfsck (plain) / n/a (encrypted) | CLEAN, 0 MiB changed |
+| D1EXFAT, D1NTFS, D1EXT4, D1BLNTFS, D1BLEXFAT | fsck.exfat / ntfs_check + ntfsfix -n / e2fsck -fn | CLEAN; every `bigwrite` file (2,200,000,000 B big.bin, 244–250 tree files) matches its keystream |
+| D2VCNTFS, D2VCEXT4, D2L1FAT32, D2L1EXT4, D2L2EXFAT, D2L4EXT4, D2L4NTFS, D2BLFAT32 | as above | CLEAN; changes are the runs' own BENCH_* files and reports |
+| **D1FAT32** | fsck.fat | **FAILED** — `Cluster 1430795 out of range (1430798 > 1430797)`; `/BENCH_BIG/big.bin` 0 bytes with a cluster chain; free-cluster summary wrong. Read set intact (20995/20995). |
+| **D2VCFAT32** | fsck.fat | **FAILED** — the same signature (`Cluster 1430732 out of range`). Read set intact (20958/20958). |
+| **D2VCEXFAT** | — | **DESTROYED** — VeraCrypt primary header damaged; the backup header decrypts, but nothing recognisable follows. 4,891,905 sectors (2.4 GB) differ from the build, sectors 0..983 and many ranges from 8,197 on. |
+
+Root causes, both fixed before run 7:
+
+- **libaums FAT32 allocated past the data area** (`84459aa`, VENDOR_FIXES V14). The
+  FAT has entries past the last data cluster, all zero, and the allocator scanned up
+  from the FSInfo hint with no bound and no wrap. On D1FAT32, `SlicedBlockDevice`
+  refused the write ("Write exceeds slice bounds"), which left the 0-byte file with a
+  chain. `Fat32AllocBoundsTest` fails on the old code: the image grows by 29,184 bytes.
+- **The decrypted devices had no bounds**, so D2VCFAT32's runaway clusters went
+  straight through `NativeDecryptedBlockDevice` into the next partition, D2VCEXFAT,
+  across runs 3, 4 and 6 (`8ac715b`, `requireInRange` on every decrypting device and
+  on `CachedBlockDevice.writeBlocks`). `LuksSectorSizeTest.checkBounds` fails on the
+  old code for luks1/512 and luks2/4096.
+
+All 20 partitions were then rewritten from their build images
+(`write_matrix_drive.sh`, REWRITE mode), read back, and verified: **all 20 CLEAN, 0 MiB
+changed** against the build baselines.
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit 9e6397e — device-matrix Drives 1 + 2, run 5
+
+Started 07:06:08. Sections:
+`free,block,dir,path,seq,random,opens,write,unaligned,correct,bigwrite,fixtures`,
+cache default, remount true. All 21 partitions attached; screen interactive throughout.
+
+| Partition | Container / FS | Verdict |
+|---|---|---|
+| EFI | plain FAT32 (macOS's) | no BENCH/; block reads only |
+| D1APFSCI, D1APFSCS | plain APFS | write sections SKIPPED (read-only); fixtures ALL 22129 / ALL 22024 MATCHED |
+| D1APFSECI, D1APFSECS | encrypted APFS | write sections SKIPPED (read-only); fixtures ALL 21777 / ALL 21911 MATCHED |
+| D1FAT32 | plain FAT32 | write verify PARTIAL (remount not performed); unaligned NOT VERIFIED; correctness: no live mount; bigwrite wrote 2,200,000,000 B at 8.61 MB/s, then NOT VERIFIED (drive did not come back); fixtures ALL 20995 MATCHED |
+| D1EXFAT, D1NTFS, D1EXT4 | plain | not mounted at the start of their turn — skipped |
+| D1BLNTFS | BitLocker NTFS | write verify, unaligned A+B, correctness A–G ALL PASSED; bigwrite ALL PASSED after remount (big.bin 3.22 MB/s write, 29.26 MB/s read; 246 tree files); fixtures ALL 20905 MATCHED |
+| D1BLEXFAT | BitLocker exFAT | write verify, unaligned A+B, correctness A–G ALL PASSED; bigwrite ALL PASSED after remount (big.bin 0.71 MB/s write, 23.58 MB/s read; 248 tree files); fixtures ALL 20898 MATCHED |
+| D2VCFAT32 | VeraCrypt FAT32 | write verify PARTIAL; unaligned FAILED (could not create BENCH_UNALIGNED); correctness: no live mount; bigwrite could not delete the previous BENCH_BIG/BENCH_TREE (block device closed) |
+| D2VCEXFAT … D2BLFAT32 (9) | | not mounted at the start of their turn — skipped |
+
+Three faults in the app, fixed in `15b8448` before run 6:
+
+- **Plain partitions were not remounted** after a remount on a drive that also held
+  encrypted ones; `reprobeHeldDevices` now re-probes them too.
+- **Drive 2 was lost** because unmount bookkeeping finished up to 70 s after the
+  remount had already started (`unmountsInFlight`).
+- **bigwrite wrote through a dropped mount**; it now checks that the mount is live.
+
+Host verification: above, after runs 3–6.
+
+### Runs 3, 4 and 6 — stopped, no report
+
+Each was stopped once logcat showed a fault that made the rest of the run pointless.
+None wrote a report (the `benchmark.txt` on the phone still held the previous run's),
+so there is no row to give. They are listed because their writes are in the host
+check above.
+
+- **Run 3**, commit `f364ae9`: every remount "did not change the mount identity",
+  so the remount proof was always false. Fixed in `d355f0f` by comparing filesystem
+  objects instead of mount IDs.
+- **Run 4**, commit `d355f0f`: Drive 1 dropped at the first remount. Unmounting
+  encrypted APFS closed the slice, and with it the whole USB connection. Fixed in
+  `9e6397e`.
+- **Run 6**, commit `15b8448`, `--es drive D1FAT32,D1EXFAT,D1NTFS,D1EXT4,D2`:
+  "Write exceeds slice bounds" on D1FAT32 and "read … exceeds device" on D2VCFAT32.
+  These are the two root causes above.
+
+## 2026-10-03
+
+**Commit hashes on these dates.** The runs below were built from `feature/apfs`, which
+was rebased onto `main` on 2026-10-04 after #27 and #28 were merged. The rows keep the
+hashes the reports were stamped with; the same commits after the rebase are:
+
+| In the reports | After the rebase | Commit |
+|---|---|---|
+| `d9594a9` | `d6ef7f6` | licence: move the project to GPL-3.0-or-later (run 1) |
+| `904e1da` | `ef6d88b` | remounts keep the USB connection; writes mount read-write (run 2) |
+| `f364ae9` | `81d16cc` | docs: record run 2 (run 3) |
+| `d355f0f` | `ff432b7` | prove a remount by filesystem object (run 4) |
+| `9e6397e` | `1327be0` | fix: unmounting encrypted APFS closed the whole stick (run 5) |
+| `15b8448` | `9d1651d` | remount only after every unmount's bookkeeping (run 6) |
+
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit 904e1da — device-matrix Drives 1 + 2, run 2
+
+Same drives, hub and sections as run 1; started 14:40:46, all 21 partitions attached
+(the read-only, lost-remount and wait-for-unlocks fixes in). Screen interactive
+throughout.
+
+| Partition | Container / FS | Verdict |
+|---|---|---|
+| D1APFSCI | plain APFS | write sections SKIPPED (read-only); fixtures ALL 22129 MATCHED |
+| D1APFSCS | plain APFS | write sections SKIPPED (read-only); fixtures ALL 22024 MATCHED |
+| D1FAT32 | plain FAT32 | write verify PARTIAL (remount pass not performed — drive did not come back); unaligned FAILED (no working directory); correctness: no live mount; fixtures FAILED (USB block device is closed) |
+| D1EXFAT, D1NTFS, D1EXT4, D1APFSECI, D1APFSECS, D1BLNTFS, D1BLEXFAT | | not mounted at the start of their turn — skipped |
+| D2VCFAT32 | VeraCrypt FAT32 | write verify ALL PASSED; unaligned NOT VERIFIED; correctness: no live mount; fixtures FAILED (closed) |
+| D2VCEXFAT, D2VCNTFS, D2VCEXT4 | VeraCrypt | not mounted at the start of their turn — skipped |
+| D2L1FAT32 | LUKS1 FAT32 | write verify ALL PASSED (16 MiB at 0.46 MB/s); unaligned NOT VERIFIED; correctness: no live mount; fixtures FAILED (closed) |
+| D2L1EXT4 | LUKS1 ext4 | write verify ALL PASSED; unaligned A, B PASS; correctness NOT VERIFIED; fixtures FAILED (closed) |
+| D2L2EXFAT | LUKS2 exFAT | write verify ALL PASSED; unaligned NOT VERIFIED; correctness: no live mount; fixtures FAILED (unmounted) |
+| D2L4EXT4 | LUKS2 4K ext4 | write verify ALL PASSED; unaligned A, B PASS; correctness NOT VERIFIED; fixtures FAILED (closed) |
+| D2L4NTFS | LUKS2 4K NTFS | write verify ALL PASSED; unaligned A, B PASS; correctness ALL PASSED (A–G, incl. the 2100 MiB file); fixtures ALL 20927 MATCHED |
+| D2BLFAT32 | BitLocker FAT32 | write verify PARTIAL; unaligned and correctness NOT VERIFIED ("mount identity did not change"); fixtures ALL 20974 MATCHED |
+
+Two causes, both outside the drives:
+
+- **Drive 1 dropped off the USB bus at 15:06:41** and re-enumerated (kernel
+  `usb-storage 2-1.2: USB Mass Storage device detected`). Android bound it first and
+  mounted D1FAT32, D1EXFAT, D1NTFS and D1EXT4 read-write from 15:06:42 (after
+  `fsck_msdos` and `fsck.exfat`), and they stayed mounted until `sm unmount` at about
+  15:50. Why the stick dropped is not known: logcat had rotated past it. **Anything the
+  host check finds on those four not explained by the runs is Android's.**
+- **The remount wait raced the unlocks.** A remount returned as soon as its own drive
+  was back, with other unlocks still queued; the next section's unmount then waited on
+  deviceMutex for its bookkeeping, candidates were missing from the next mount request,
+  and drives "did not come back". Fixed in `2f4dd2c` (`awaitUnlocks`). "Mount identity
+  did not change" on D2BLFAT32 is the same race seen from the other side.
+
+Host verification: after run 3 — the drives were not moved.
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) commit d9594a9 — device-matrix Drives 1 + 2, run 1
+
+The first run on the device-matrix drives (`docs/TEST_DATA.md` §16): Drives 1 and 2,
+two 62 GB PNY "USB 3.2.1 FD" sticks on one powered hub, 21 partitions between them.
+Sections: `free,block,dir,path,seq,random,opens,write,unaligned,correct,fixtures`,
+cache default, remount true. Started 13:49:53, screen interactive throughout.
+
+**Only 11 of the 21 partitions were measured.** The benchmark ended its mount wait
+when the mount count had been still for 3 s, while ten unlocks were still queued behind
+the LUKS1 keyslots (2.8M PBKDF2 iterations each). Fixed in `10f721e`.
+
+| Partition | Container / FS | Verdict |
+|---|---|---|
+| EFI | plain FAT32 (macOS's) | no BENCH/; block reads only |
+| D1APFSCI | plain APFS, case-insensitive | fixtures: ALL 22129 MATCHED; write sections FAILED as read-only (should be SKIPPED, fixed in `1e69e8b`) |
+| D1APFSCS | plain APFS, case-sensitive | fixtures: ALL 22024 MATCHED; write sections as above |
+| D1FAT32 | plain FAT32 | write verify PARTIAL (2 of 3 passes — "the drive did not come back after unmounting"); unaligned FAILED; correctness: no live mount; fixtures FAILED (USB block device is closed) |
+| D1EXFAT, D1NTFS, D1EXT4 | plain | not mounted at the start of their turn — skipped |
+| D2VCFAT32 | VeraCrypt FAT32 | fixtures: ALL 20958 MATCHED; write sections FAILED: mounted read-only |
+| D2VCEXFAT | VeraCrypt exFAT | fixtures: ALL 20974 MATCHED; write sections FAILED: mounted read-only |
+| D2VCNTFS | VeraCrypt NTFS | fixtures: ALL 20919 MATCHED; write sections FAILED: mounted read-only |
+| D2VCEXT4 | VeraCrypt ext4 | fixtures: ALL 21071 MATCHED; write sections FAILED: mounted read-only |
+
+Three harness faults, all fixed in `904e1da` before run 2:
+
+- **Read-only mounts.** The phone's "mount encrypted partitions read-only by default"
+  is on, and the benchmark's mount followed it.
+- **A remount lost Drive 1.** `remountAndProve` unmounted every drive; the mount
+  request re-probed USB only when no candidates were listed, and Drive 2's locked
+  candidates kept the list non-empty, so Drive 1 was never reopened.
+- **Android took the released drive.** At 14:14:59–14:15:19 vold ran `fsck_msdos` and
+  `fsck.exfat` on Drive 1 and mounted D1FAT32, D1EXFAT, D1NTFS and D1EXT4 read-write
+  (StorageManagerService in logcat). They were unmounted with `sm unmount` at about
+  14:30. **Any change the host check finds on those four not explained by the runs is
+  Android's**, not the app's — and is what this fault would do to a user's drive.
+
+libexfat also warned "volume was not unmounted cleanly" on D1EXFAT at the very first
+mount, while the read-back taken before the phone shows the flag clear: most likely
+Android had mounted it on plug-in before the app claimed the stick.
+
+Host verification: after run 2, below — the drives were not moved between runs.
+
+## 2026-10-01
+
+### OnePlus 7 (GM1901) · LineageOS 23.2 (Android 16, SDK 36) · build 0.4.1 (47) — drive D p3, plain NTFS `NTFSPLAIN`
+
+First NTFS runs, on the libntfs-3g driver. Drive D in its Realtek card reader,
+plugged in directly, on battery at 37–38% (below the procedure's ~40%; no
+drop-out occurred). Screen on, unthrottled at both ends. The partition was
+empty when the work started.
+
+**Host checks were done over adb, not by moving the card.** `VolumeDumpReceiver`
+copies every cluster `$Bitmap` marks in use (plus both boot sectors) under the
+filesystem lock and past the block cache; `scripts/undump_volume.py` rebuilds a
+sparse image, which `ntfs_check.py`, `ntfsfix -n` and the reference ntfs-3g FUSE
+driver then read. `verify_volume.sh` / `volume_baseline.sh` were **not** run —
+there is no pre-run baseline for this partition.
+
+**Android mounts this partition itself.** The phone runs LineageOS 23.2
+(`23.2-20260920-NIGHTLY-guacamoleb`), not OxygenOS. LineageOS's vold adds NTFS (its
+own ntfs-3g 2022.10.3, `/system/bin/mount.ntfs`) and ext4 for public volumes, which
+stock AOSP does not, so this behaviour is specific to that ROM. vold
+mounted p3 read-write (hidden, `mountFlags=0`) every time the reader was
+released; each time the app claimed the reader, that mount was cut off with
+`Failed to sync device: I/O error`. Every host check below was taken after at
+least one such cut-off and found the volume clean — but it is the same race that
+leaves ext4 needing recovery, and a cut-off during an Android-side write would not
+be.
+
+**Commit hashes in these two rows were rewritten twice after the runs**, each time
+with no change to any tree: first when the branch's author email was changed to the
+GitHub noreply address before its first push (`git filter-branch --env-filter`), then
+when PR #21 was merged with "Rebase and merge". The reports on the drive carry the
+labels the APKs were built with; on `main` they are:
+
+| Built as | After the email rewrite | On `main` | Tree |
+|---|---|---|---|
+| `8ef3062` | `42111e3` | `55cc5eb` | `630e7e0` |
+| `863bfbf` | `bda3777` | `c976668` | `0253c55` |
+| `b9d6b9e` | `32884cc` | `54adc2e` | `89aa887` |
+
+Each row's commits have the identical tree (`git rev-parse <sha>^{tree}`).
+
+Three broadcasts before run 1 produced no result and are not rows: two because
+`--es cache …` forces an unmount (any `cache` extra sets `remount`, whatever
+`--es remount` says) and a plain partition cannot be remounted without
+credentials — `NO DRIVES MOUNTED`; one because the drive was still unmounted from
+that.
+
+**Run 1 — commit `8ef3062` (on main: `55cc5eb`, see below), clean tree.** Sections `free,block,dir,path,seq,random,opens,write,unaligned,correct,saf`.
+Report `otgbench-GM1901-20261001-123609.txt`, on the drive.
+
+| Field | Value |
+|---|---|
+| block read | 1.45 / 28.45 / 40.80 / 31.78 MB/s |
+| dir, seq, random | not measured — no fixture tree on the partition yet |
+| write | 16 MiB → 2.72 MB/s |
+| write verify | **PARTIAL 2/3** (cached, cache-dropped; no remount — plain partition, no credentials) |
+| unaligned | **NOT VERIFIED** on device — judged on the host instead, below |
+| correctness | **NOT VERIFIED** on device — judged on the host instead, below |
+| saf | provider 12.90 MB/s, direct 17.56 MB/s (1.36×), 2 streams 14.43 MB/s |
+| host, after | dump 60 MiB: `ntfs_check` **clean** (42 records, 11,925 clusters), `ntfsfix -n` **OK**. Through the reference ntfs-3g driver, every file the unaligned and correctness cases left matches its expected bytes — `tail.bin`, `trunc.bin`, `neighbour.bin`, `victim.bin`, `offsets.bin`, `appends.bin`, `fresh.bin`, `tiny.bin` — and `gone.bin` / `slackfill.bin` are deleted: **8 of 8 + 2 deletions** |
+
+**Fixture tree written by a different implementation.** 509 files + `MANIFEST.txt`
+(511 entries: 508 file hashes, 3 directory listings — empty, 600-byte resident,
+4097-byte, 24 MiB, Unicode and 190-character names, a 10-deep path, a 500-entry
+directory) were pushed through **Android's own ntfs-3g** (vold), with
+`sm set-force-adoptable on` to expose the volume at `/storage` and `default`
+restored afterwards. Hashes computed on the laptop. Android's MediaProvider also
+created its standard folders (DCIM, Music, …) on the volume.
+
+**Run 2 — APK labelled `863bfbf-dirty`; it contained exactly `b9d6b9e`** (on main: `c976668` / `54adc2e`) (built
+seconds before that commit, no edit in between; the delta is the dump's
+allocated-cluster filter, outside every code path this run measures). Sections
+`free,dir,path,fixtures`.
+
+| Field | Value |
+|---|---|
+| fixtures | **ALL 511 MATCHED** the host-computed hashes, including the 500-entry listing; 24 MiB file read at 22.22 MB/s |
+| host, after | dump 88 MiB: `ntfs_check` **clean** (585 records, 18,128 clusters), `ntfsfix -n` **OK**; all 508 fixture files match through the reference driver |
+
+---
+
+## 2026-09-29
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.4.0 (46) commit 50c62ac — drive D, p2 plain ext4 + p1 VeraCrypt + ext4
+
+The double-mount fix `8b70e79` in place (`50c62ac` is docs on top). Clean tree,
+installed immediately before, awake and unthrottled at both ends, on battery at
+56%, drive plugged in directly. Drive D had been host-checked clean just before.
+p2 mounted **once** (`Mount request: remounting plain Partition 2` after the
+startup unmount), p1 read-write by its per-partition choice.
+
+| Field | p2 plain ext4, `PLAINEXT4` | p1 VeraCrypt + ext4, `VCEXT4` |
+|---|---|---|
+| block read | 1.10 / 19.12 / 19.92 / 23.67 MB/s | 4.02 / 12.62 / 12.09 / 10.47 MB/s |
+| seq read | 20.23 / 20.08 / 14.77 MB/s | 10.52 / 10.61 / 10.62 MB/s |
+| random read | 5.3 ms each, 188.0 IOPS | 10.0 ms each, 99.7 IOPS |
+| write | 16 MiB → 2.87 MB/s | 16 MiB → 2.70 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) | **ALL PASSED** |
+| unaligned | **A + B PASS** | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED** | **ALL 5 MATCHED** |
+| e2fsck / compare | **CLEAN**; vs the post-repair baseline only the Huawei 19:54 and this run's reports (+`INDEX.txt`), free inodes −2 / blocks −4 — the stopped run's `BENCH_WRITE/verify.bin` is gone, replaced and cleaned up by this run's `write verify` | **CLEAN**; the only change since the last check is this run's report |
+
+Report `otgbench-SM-M305F-20260929-202520.txt`, on both partitions. The Samsung's
+first VeraCrypt + ext4 and plain ext4 results — its last two empty cells.
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 232887a — LUKS1 + ext4
+
+Release-candidate code (single-partition drive, so not affected by the plain
+double-mount fixed in `8b70e79`). Clean tree, installed immediately before,
+awake and unthrottled at both ends, on battery at 60%. The partition was set
+read-write (Read-only mode is on for this phone). The drive was host-checked
+clean after its Huawei run and not used since.
+
+| Field | Value |
+|---|---|
+| Report | `otgbench-GM1901-20260929-201229.txt`, on the drive |
+| block read | 2.22 / 11.53 / 19.54 / 18.77 MB/s |
+| seq read | 13.28 / 13.33 / 13.42 MB/s |
+| random read | 3.0 ms each, 330.3 IOPS |
+| write | 16 MiB → 0.60 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| e2fsck | **CLEAN** — `LUKS1EXT4: 20041/3792896 files, 927645/15142400 blocks` |
+| baseline compare | since the check after the Huawei run, one addition: this run's report (`INDEX.txt` modified). Free blocks and inodes each down by one more; checksums changed with them. Nothing else. |
+
+### Samsung M30, drive D — stopped: p2 mounted twice (no result, not a run)
+
+Build `232887a`, started 20:08. The run's mount list showed **two** `ext4 Drive`
+mounts of p2 alongside p1: the app's auto-mount of p2 from launch was still in
+flight when the benchmark's mount request (`7b5e3bb`) asked for plain partitions,
+saw none mounted, and mounted p2 again. The write section had already run on one
+of the two — `verify (cached)` and `verify (cache dropped)` matched — before the
+run was force-stopped at the remount step. The other mount was idle; ext4 writes
+nothing at unmount. No result, so no row. **Host check afterwards: both partitions
+CLEAN.** p1: only reports since its baseline. p2: the Huawei 19:54 report and
+`BENCH_WRITE/verify.bin` — the stopped run's 16 MiB test file, never cleaned up —
+with free blocks −4,099 (4,096 for the file plus metadata) and free inodes −3
+(report, directory, file). The double mount did no damage. Fixed in the commit after this one (`mountPlainDevice` refuses
+a partition already mounted or being mounted).
+
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.4.0 (46) commit eb4ff66 — VeraCrypt + exFAT and VeraCrypt + FAT32
+
+Release-candidate code. Clean tree, installed immediately before, awake and
+unthrottled at both ends, AC powered at 79%. Both partitions set read-write
+(Read-only mode is on for this phone). Both drives were host-checked clean just
+before (exFAT after the OnePlus run, FAT32 after the Samsung run).
+
+| Field | VC + exFAT, `exFAT` | VC + FAT32, `VCFAT` |
+|---|---|---|
+| seq read (512 KiB) | 32.25 MB/s | 21.16 MB/s |
+| random read | 2.9 ms each, 346.5 IOPS | 5.9 ms each, 169.9 IOPS |
+| write | 16 MiB → 0.62 MB/s | 16 MiB → 2.57 MB/s |
+| write verify | **ALL PASSED** | **ALL PASSED** |
+| unaligned | **A + B PASS** | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED** | **ALL 16 MATCHED** |
+| fsck / compare | **CLEAN** — `fsck.exfat` 19 dirs, 20101 files; only this run's report added since the last check. FAT differs by ~3,072 entries (≈1 before): a fragmented 16 MiB write leaves its stale chain after deletion, as on drive A's exFAT partitions; bitmap not captured, so consistent rather than proven | **CLEAN** — `fsck.fat` 20090 files, no "FATs differ"; only this run's report added since the last check; FAT[0] and FAT[1] each 31 bytes from baseline, identical |
+
+Report `otgbench-Pixel_10_Pro_XL-20260929-200239.txt`, on both drives. No USB
+errors or retries.
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit 4a88c83 — drive D, p2 plain ext4 + p1 VeraCrypt + ext4
+
+Release-candidate code plus the runner fix `7b5e3bb`, whose first run this is:
+after the startup unmount the log shows `Mount request: remounting plain
+Partition 2`, and both partitions were measured. Clean tree, installed
+immediately before, awake and unthrottled at both ends, **on battery at 35% →
+30%**. p2 had been repaired and re-baselined on the host just before.
+
+| Field | p2 plain ext4, `PLAINEXT4` | p1 VeraCrypt + ext4, `VCEXT4` |
+|---|---|---|
+| block read | 1.45 / 20.70 / 26.71 / 29.03 MB/s | 1.46 / 6.65 / 7.71 / 8.48 MB/s |
+| seq read | 17.14 / 18.94 / 20.12 MB/s | 6.42 / 6.54 / 6.37 MB/s |
+| random read | 4.9 ms each, 203.7 IOPS | 11.9 ms each, 83.8 IOPS |
+| write | 16 MiB → 2.34 MB/s | 16 MiB → 1.91 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) | **ALL PASSED** |
+| unaligned | **A + B PASS** | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED** | **ALL 5 MATCHED** |
+| e2fsck / compare | **CLEAN**, see the Samsung note above | **CLEAN**, see the Samsung note above |
+
+Report `otgbench-ANE-LX1-20260929-195401.txt`, on both partitions. The Huawei's
+first plain-ext4 result, and its remount pass completed — EMUI does not mount
+ext4 itself, so p2 came up writable.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.4.0 (46) commit 3e3d051 — drive A, all four partitions
+
+Release-candidate code. Clean tree, installed immediately before the run, awake
+and unthrottled at both ends, on battery at 80%. Read-only mode is on for this
+phone; the four partitions were set read-write for the run. Not host-checked
+before the run; last checked clean after the OnePlus `4ea6a49` run.
+
+| Partition | seq read (512 KiB) | write | write verify | unaligned | correctness | fixtures |
+|---|---|---|---|---|---|---|
+| P1 LUKS1 + FAT32 | 34.08 MB/s | 1.93 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P2 LUKS1 + exFAT | 32.37 MB/s | 0.56 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P3 LUKS2 + FAT32 | 34.96 MB/s | 2.26 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P4 LUKS2 + exFAT | 32.45 MB/s | 0.65 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+
+Report `otgbench-Pixel_10_Pro_XL-20260929-195058.txt`, written to all four
+partitions.
+
+**Host check:** all four **CLEAN** (`fsck.fat` P1 20026 files, P3 20023; `fsck.exfat`
+P2 and P4 17 dirs, 20007 files). Each compare shows only the OnePlus 06:25 report
+and this run's, plus `INDEX.txt`. FAT32: FAT[0] and FAT[1] change identically on P1
+(26 bytes) and P3 (30 bytes). exFAT FAT churn ~4,099 entries on P2 (one 16 MiB
+write since its baseline = 4,096 clusters) and ~8,161 on P4 (two runs) — the stale
+entries a freed fragmented file leaves, not damage. (The partitions are listed by what
+the runner measured, `[0] exFAT @33554432 … [3] LUKS1FAT @2048`, mapped to P1–P4
+by start block.)
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit f51131f — drive D p1, VeraCrypt + ext4
+
+Release-candidate code. Clean tree, installed immediately before the run, awake
+and unthrottled at both ends, on battery at 40%. Meant to cover p1 and p2; **p2
+was not measured** — the runner's startup unmount took down the auto-mounted p2
+and the mount request brought back p1 only. Fixed in `7b5e3bb`.
+
+| Field | Value |
+|---|---|
+| Report | `otgbench-ANE-LX1-20260929-194018.txt`, on the drive |
+| block read | 1.25 / 6.72 / 7.80 / 8.36 MB/s |
+| seq read | 6.42 / 6.62 / 6.67 MB/s |
+| random read | 11.5 ms each, 86.9 IOPS |
+| write | 16 MiB → 1.43 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| e2fsck / compare | **CLEAN** — covered by the host check after the stopped Samsung run: p1 shows only reports |
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 3f535b7 — VeraCrypt + exFAT
+
+Release-candidate code. Clean tree, installed immediately before the run, awake
+and unthrottled at both ends, on battery at 54%. Read-only mode is on for this
+phone; this partition was set read-write for the run. **The drive was not
+host-checked before the run** — its last runs (Samsung `7beefe8`, and the three
+read-only checks) are still unchecked, so the next host compare covers all of
+them together.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT, `exFAT` |
+| Report | `otgbench-GM1901-20260929-193341.txt`, on the drive |
+| block read | 5.24 / 19.29 / 17.52 / 19.40 MB/s |
+| seq read | 12.88 / 12.76 / 12.82 MB/s |
+| random read | 3.8 ms each, 265.7 IOPS |
+| write | 16 MiB → 0.46 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck / compare | **CLEAN** (host check after the OnePlus `3f535b7` run, covering the Samsung `7beefe8` run and the read-only checks too): `fsck.exfat` clean, 19 dirs, 20100 files. Compare vs the post-repair baseline: only the Samsung 09:32 read-write report and the OnePlus 19:33 report added, `INDEX.txt` modified; FAT ~1 entry; boot region identical. **Nothing from the two read-only runs reached the drive.** |
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.4.0 (46) commit 3f535b7 — VeraCrypt + FAT32
+
+Release-candidate code. Clean tree, installed immediately before the run, awake
+and unthrottled at both ends, on battery at 63%, **drive plugged in directly — no
+multiport adapter**. The phone's Read-only mode setting is on; this partition was
+set read-write for the run (its per-partition choice, as the form switch sets it).
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `otgbench-SM-M305F-20260929-193313.txt`, on the drive |
+| block read | 1.90 / 4.57 / 12.20 / 10.76 MB/s |
+| seq read | 2.63 / 7.22 / 7.00 MB/s |
+| random read | 6.7 ms each, 148.2 IOPS |
+| write | 16 MiB → 0.99 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `fsck.fat`: 20089 files, 14241975/15113321 clusters, no "FATs differ" |
+| baseline compare | only this run's report added since the last check (plus the two earlier reports already seen), `INDEX.txt` modified; **FAT[0] and FAT[1] each 21 bytes at byte 57,000,901, identical** (14 before this run); FSInfo 3 bytes |
+
+No USB errors or retries in the whole run — the first Samsung run of the day
+without the adapter, and the first to complete `fixtures`.
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit 9b91328 — LUKS2 + ext4
+
+Release-candidate code (`9b91328` is docs-only on top of `59805ed`). Clean tree,
+installed immediately before the run, awake and unthrottled at both ends, **on
+battery at 46%**. The drive was checked clean on the host just before.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD — LUKS2 (Argon2id) + ext4, `LUKS2EXT4` |
+| Report | `otgbench-ANE-LX1-20260929-192628.txt`, on the drive |
+| block read | 2.34 / 5.99 / 8.10 / 8.27 MB/s |
+| seq read | 6.52 / 6.75 / 6.66 MB/s |
+| random read | 8.9 ms each, 112.5 IOPS |
+| write | 16 MiB → 0.55 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| e2fsck | **CLEAN** — `LUKS2EXT4: 20039/3784704 files, 927124/15138816 blocks` |
+| baseline compare | against the check taken just before this run, one addition: this run's report (`INDEX.txt` modified). Free blocks and inodes each down by one more; superblock, group 0 and bitmap checksums changed with them. Nothing else. |
+
+In line with this device's LUKS1+ext4 run this morning (seq 6.2–6.7, write 0.57).
+
+### Drive D p2 (plain ext4) — host repair after Android's interrupted mounts
+
+p2 had been mounted by the OnePlus's own Android at every plug-in and cut off
+each time OTG Master claimed the reader, leaving `needs_recovery` set; one
+laptop mount had already replayed a stale journal (08:30:49).
+
+| Step | Result |
+|---|---|
+| `e2fsck -fn` before | `needs_recovery` set (last kernel mount 09:01:49, mount count 6); group 0 free blocks off by one (22985 vs 22986) — the same numbers as before the 08:30 replay |
+| `e2fsck -fy` | journal recovered; the free-block count fixed; `FILE SYSTEM WAS MODIFIED` |
+| `e2fsck -fn` after | **CLEAN**; `needs_recovery` gone, state clean |
+| compare vs the 2026-09-28 baseline | 4 OnePlus reports added (07:44, 07:47, 07:55, 08:02), `INDEX.txt` modified; 8 scratch files removed from `BENCH_CORRECT/` and `BENCH_UNALIGNED/` (left by the Pixel run before the baseline, cleaned up by today's runs) with their two directories; free inodes +6 = 8 + 2 − 4. No other file changed. |
+
+So the interrupted Android mounts and the journal replay damaged nothing beyond
+the one summary count. p1, written by the same app code and invisible to
+Android, was clean throughout — the count came from the OS side. Re-baselined
+after the repair (20016 files, 20033 tree entries); the old baseline is kept as
+`PLAINEXT4.pre-repair-20260929`.
+
+### LUKS2 + ext4 (Drive C) — host check before the Huawei release-candidate run
+
+`e2fsck` **CLEAN**. The compare shows only the 2026-09-28 Pixel (21:14) and OnePlus
+(21:28) reports and `INDEX.txt`; free blocks and inodes are down by exactly 2.
+This closes the host check for both of those runs.
+
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 5bc20eb — drive D p1, VeraCrypt + ext4
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, **on battery at 57%**. The release candidate's code: connection fix, V11–V13,
+read-only mode (off for this partition), the ext4 journal guard. Run with
+`--es drive VCEXT4`: p2 is mounted read-only on this phone because Android had
+mounted it and been cut off (`needs_recovery`), so its write sections could only
+fail; it needs a host `e2fsck` first.
+
+| Field | Value |
+|---|---|
+| Report | `otgbench-GM1901-20260929-190728.txt`, on the drive |
+| block read | 1.33 / 14.80 / 17.89 / 16.84 MB/s |
+| seq read | 11.48 / 11.79 / 11.72 MB/s |
+| random read | 5.8 ms each, 171.9 IOPS |
+| write | 16 MiB → 1.09 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| e2fsck | **CLEAN** — `VCEXT4: 20038/764032 files, 685287/3053504 blocks` |
+| baseline compare | 3 reports added since the baseline — 06:33 Huawei, 08:02 OnePlus (`dae0ebf`), and this run's — and `INDEX.txt` modified. Free inodes 743997 → 743994 (one per report), free blocks 2368221 → 2368217 (the reports and `INDEX.txt` growing); superblock, group 0 and bitmap checksums changed with them. Nothing else. This covers the `dae0ebf` run's p1 too. |
+
+**Throughput is about half the `dae0ebf` run on the same card and phone** (seq
+21.1 → 11.7 MB/s, write 3.17 → 1.09 MB/s). That run was also awake and
+unthrottled; this one was on battery at 57%. The builds differ only in error
+paths and an unused read-only wrapper, so a code cause is unlikely, but not
+shown. Not comparable figures until re-run under matching conditions.
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) — VeraCrypt + exFAT, read-only mode checks
+
+Three `--es tests write` runs to check read-only mode on exFAT, the one
+filesystem its host tests cannot cover (libexfat is native Android code). Clean
+tree each time, installed immediately before. Setting toggled through the real
+Settings drawer; the unlock form's switch followed it.
+
+| Time | Commit | Read-only | Result |
+|---|---|---|---|
+| 09:29 | `0aee16b` | on | mounted `exfat mounted successfully (read-only)`, card tagged **READ-ONLY**. `write verify` **FAILED** as intended — but the refusal came from `ReadOnlyBlockDeviceDriver` (`volume is mounted read-only`): libexfat's mkdir still issued a device write despite `ro`. Fixed in `640d05c`. |
+| 09:31 | `640d05c` | on | `write verify` **FAILED** as intended, now with `exFAT volume is mounted read-only` from the exFAT layer; no write reached the device layer. Report not written to the drive, as intended. |
+| 09:31 | `640d05c` | off | mounted read-write; 16 MiB → 0.36 MB/s; `write verify` **ALL PASSED** (remounted); report written to the drive. |
+
+Host compare afterwards (after the OnePlus `3f535b7` run): only the 09:32
+read-write run's report and the OnePlus report were added — **nothing from the
+read-only runs**, confirmed through the kernel's exFAT driver rather than ours.
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.4.0 (46) commit 7beefe8 — VeraCrypt + exFAT
+
+Clean tree (later commits are docs only), installed immediately before the run,
+awake and unthrottled at both ends, AC powered at 100% — through the USB-C
+multiport adapter the drive also hangs off. The V12 validation run.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT, `exFAT` |
+| Report | `Documents/otgbench-SM-M305F-20260929-085653.txt` on the phone only |
+| block read | 3.84 / 11.65 / 12.97 / 11.68 MB/s |
+| seq read | 9.76 / 9.99 / 10.04 MB/s |
+| random read | 6.5 ms each, 154.0 IOPS |
+| write | 16 MiB → **0.36 MB/s** (0.68 on the previous run) |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **FAILED** — `exFAT read failed at offset 615776256 (262144 bytes): -5` |
+| fsck / compare | **CLEAN** (host check after the OnePlus `3f535b7` run, covering the Samsung `7beefe8` run and the read-only checks too): `fsck.exfat` clean, 19 dirs, 20100 files. Compare vs the post-repair baseline: only the Samsung 09:32 read-write report and the OnePlus 19:33 report added, `INDEX.txt` modified; FAT ~1 entry; boot region identical. **Nothing from the two read-only runs reached the drive.** |
+
+**The adapter disconnected, not the app.** At 08:56:51.5 `UsbHostManager` logged
+the removal of every device on the multiport adapter at once — its gigabit LAN
+(`0bda:8153`), its hub (`2109:8817`) and the drive (`154b:1006`). Every transfer
+then returned `-1`; V12's Reset Recovery ran before each retry and failed
+immediately (`bulk only mass storage reset failed!`) because there was no device
+to reset, was logged, and the retries proceeded to `MAX_RECOVERY_ATTEMPTS` as
+before. So this run shows V11 + V12 do not disturb normal transfers — every write
+section passed — but not V12's recovery succeeding on hardware; that rests on
+`ScsiResetRecoveryTest`. This morning's dropped Samsung exFAT run went through the
+same adapter.
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.4.0 (46) commit a192b12 — VeraCrypt + exFAT
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, on the charger directly at 100%. The hardware validation run for V11, on
+the drive repaired and re-baselined this morning.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT, `exFAT` |
+| Report | `Documents/otgbench-SM-M305F-20260929-081623.txt` on the phone only — writing it to the drive failed |
+| block read | 3.08 / 12.04 / 12.88 / 11.82 MB/s |
+| seq read | 9.82 / 9.93 / 10.05 MB/s |
+| random read | 6.3 ms each, 159.3 IOPS |
+| write | 16 MiB → 0.68 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **FAILED** — `exFAT read failed at offset 732692480 (262144 bytes): -5` |
+| fsck | **CLEAN** — `fsck.exfat`: directories 19, files 20098 |
+| baseline compare | **NO CHANGE** in files, FAT or boot region against the post-repair baseline. One directory fewer (20 → 19; tree entries 20117 → 20116): `BENCH_WRITE`, left by the repair, which this run's `write verify` recreated and removed as designed. The script's verdict ignores directory-only changes — a gap in `volume_baseline.sh`, not in the drive. |
+
+A read returned `-1`; every retry then failed with `wrong csw tag!` until
+`MAX_RECOVERY_ATTEMPTS`, and so did the next command, and the report write after
+that. **V11 held** — no `IllegalArgumentException`, nothing misplaced — but it
+exposed V12: libaums never sent Reset Recovery after a failed transfer, so the
+device's leftover CSW kept every later command one status behind. The failure
+was a read, after every write section had finished, so no write was in flight.
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit dae0ebf — drive D, p2 plain ext4 + p1 VeraCrypt + ext4
+
+**The hardware confirmation of `9404e46`**, and the first run on any device in
+which a plain partition passed the remount pass. Clean tree, installed
+immediately before the run, awake and unthrottled at both ends, on battery at
+81%. An earlier start on the same code was stopped during the read-only sections
+because its APK had been built before `dae0ebf` was committed and was labelled
+`9404e46-dirty`; nothing had been written.
+
+With `dae0ebf` the runner requests the unlock even though the re-probe has
+already auto-mounted p2, so both partitions were mounted — and every remount in
+the run unmounted and remounted **two drives on one USB connection**, the case
+that failed on `b850696`.
+
+| Field | p2 plain ext4, `PLAINEXT4` | p1 VeraCrypt + ext4, `VCEXT4` |
+|---|---|---|
+| block read | 1.97 / 43.88 / 62.13 / 59.33 MB/s | 4.60 / 19.84 / 23.45 / 23.84 MB/s |
+| seq read | 31.19 / 34.17 / 36.50 MB/s | 21.12 / 20.22 / 21.23 MB/s |
+| random read | 3.9 ms each, 253.8 IOPS | **94.7 ms each, 10.6 IOPS** — 5.5 ms on the same card and phone this morning; unexplained |
+| write | 16 MiB → 3.40 MB/s | 16 MiB → 3.17 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) | **ALL PASSED** |
+| unaligned | **A + B PASS** | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED** | **ALL 5 MATCHED** |
+| e2fsck / compare | pending | pending |
+
+Report `otgbench-GM1901-20260929-080242.txt`, written to both partitions.
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 9404e46 — drive D p2, plain ext4
+
+The first run with the connection fix, before the runner change. After the
+runner's startup unmount the re-probe auto-mounted p2, the runner then saw a
+mounted drive and skipped the unlock, so this run measured **p2 only** — the
+defect `dae0ebf` fixes.
+
+| Field | Value |
+|---|---|
+| seq read | 34.88 / 33.28 / 35.69 MB/s |
+| write | 16 MiB → 3.38 MB/s |
+| write verify | **PARTIAL — 2 of 3**; the remount pass was not performed. p2 was the only drive mounted, p1's candidate held the connection, so nothing re-probed and p2 did not come back. |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED** |
+
+The trace confirms the fix. At 07:54:00 a two-drive unmount went: p2 done with
+`stillUnmounting=true` and **no probe**; p1 done 3 ms later, old connection
+closed; then one probe, one new connection (`11bd0c8`), and p1 unlocked through
+it. On `b850696` a probe opened a second connection while p1 was still
+unmounting.
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit a03da36 — drive D, two `write,unaligned` repros
+
+Instrumented build (connection identities logged), run twice with
+`--es tests write,unaligned` to reproduce the `b850696` failure. **Neither
+reproduced it** — the window depends on p1's unmount finishing after the re-probe,
+and in both runs it finished within 4 ms of p2's. Both runs happened to measure
+p2, the first drive mounted.
+
+| Run | write verify | unaligned |
+|---|---|---|
+| 07:41 | **PARTIAL — 2 of 3** (p2 did not come back; p1 did) | **A + B PASS** |
+| 07:44 | **PARTIAL — 2 of 3** | **A + B PASS** |
+
+What they did show: every unmount logged `opened=null`, so the old connection
+was never closed, and at 07:44:46 a probe opened a new connection 19 ms after
+the first of two unmounts finished, while the second was still in progress.
+Both are fixed in `9404e46`.
+
+---
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.4.0 (46) commit a03da36 — VeraCrypt + FAT32
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, on the charger directly (no hub) at 100%. `a03da36` is logging only; a
+single-partition drive does not reach the path `9404e46` changes.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `Documents/otgbench-SM-M305F-20260929-075345.txt` on the phone only — writing it to the drive failed |
+| block read | 1.97 / 5.41 / 13.24 / 10.86 MB/s |
+| seq read | 2.85 / 7.26 / 7.22 MB/s |
+| random read | 7.1 ms each, 141.8 IOPS |
+| write | 16 MiB → 1.04 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **FAILED** — `IllegalArgumentException` from `ByteBuffer.limit()` in libaums `transferOneCommand` |
+| fsck | **CLEAN** — `fsck.fat`: 20088 files, 14241973/15113321 clusters, no "FATs differ" |
+| baseline compare | **identical to the compare taken before this run**: the same two earlier reports and `INDEX.txt`, and FAT[0]/FAT[1] each the same 14 bytes at byte 57,000,901. This run's scratch files were all removed and its report never reached the drive, so it left no trace — the fixtures failure was a read. |
+
+A read returned `-1`, the retry got `wrong csw tag!`, and the next retry threw.
+`transferOneCommand` takes `inBuffer.position()` as each attempt's start, but the
+failed attempt had already advanced it with a partial read, so the retry set a
+limit past the buffer's end. `IllegalArgumentException` is not an `IOException`,
+so it escaped the retry loop at once: a transport hiccup the loop exists to
+absorb became a hard failure, and the device stayed out of step for the report
+write too. A libaums defect, not the drive.
+
+---
+
+### VeraCrypt + exFAT (PNY, `VCEXFAT`) — host check and repair after the dropped Samsung run
+
+The Samsung run of 06:54 lost this drive's transport during `write verify` and
+was force-stopped (not logged; no result). On the host:
+
+| Check | Result |
+|---|---|
+| `fsck.exfat` | **ERROR** — `/BENCH_WRITE: cluster 0xd70633 is marked as free` |
+| compare | only two earlier reports and `INDEX.txt` changed; FAT ~1 entry; boot region identical. `BENCH_WRITE` unreadable on the host (`Input/output error`). |
+| repair | `fsck.exfat -y` truncated `BENCH_WRITE` → `clean. directories 20, files 20098` |
+| re-verify | **CLEAN** |
+
+`BENCH_WRITE` is the directory `write verify` was creating when the transport
+died (`Failed to create exFAT directory: -5`). Its directory entry reached the
+disk and the bitmap update did not — the torn write exFAT's lack of a journal
+allows, in the worse of the two orders: bitmap-first would have leaked a cluster
+harmlessly, entry-first leaves a cluster a later allocation can hand out twice.
+Whether that order is libexfat's or the block cache's flush order is not yet
+known. Reachable only when a drive drops mid-write. The baseline predates the
+repair and is being retaken.
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit b850696 — LUKS1 + ext4
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, on battery at 82%. The first LUKS1+ext4 run on this device.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD — LUKS1 + ext4, `LUKS1EXT4` |
+| Report | `otgbench-ANE-LX1-20260929-070630.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.96 / 5.30 / 7.73 / 8.29 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 6.17 / 6.53 / 6.73 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 9.0 ms each, 110.6 IOPS |
+| write | 16 MiB → 0.57 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| e2fsck | **CLEAN** — `LUKS1EXT4: 20040/3792896 files, 927644/15142400 blocks` |
+| baseline compare | 2 reports added — this run's and `otgbench-Pixel_10_Pro_XL-20260928-212429.txt`, which postdates the baseline — and `INDEX.txt` modified. Free blocks 14214758 → 14214756, free inodes 3772858 → 3772856: one block and one inode per report. Superblock, group 0 and bitmap checksums changed with them. Nothing else. |
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit b850696 — drive D p1, VeraCrypt + ext4
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, on battery at 91%. **Completed with failures — an app defect, not the card.**
+
+| Field | Value |
+|---|---|
+| Drive | Realtek card reader, 11927 MiB — VeraCrypt (AES/SHA-512, PIM 1) + ext4, `VCEXT4` |
+| Report | `Documents/otgbench-GM1901-20260929-070404.txt` on the phone only — nothing was mounted at the end, so no copy reached the card |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.81 / 15.43 / 26.10 / 23.07 MB/s |
+| seq read | 20.82 / 21.39 / 20.99 MB/s |
+| random read | 5.5 ms each, 180.6 IOPS |
+| write | 16 MiB → 3.15 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **NOT VERIFIED** — the drive did not come back after unmounting |
+| correctness | **could not run** — no live mount |
+| fixtures | **FAILED** — `block device is closed (volume was unmounted)` |
+| e2fsck / compare | pending |
+
+What happened, from logcat. The runner's startup `unmountAll` took down the
+plain p2 the app had auto-mounted, and the mount request that followed covers
+encrypted candidates only, so the run started with p1 alone. `write verify`'s
+remount re-probed the card, and the app auto-mounted p2 again. The next remount
+(`unaligned`) therefore unmounted **two** drives on one USB device. The app
+re-opened the card, and the mount request that followed was issued for **2
+candidates** — the card has one encrypted partition. Reads on it failed with
+`result == -1`, the signature of a USB connection that has been closed, and
+nothing mounted. Every later section then had no drive.
+
+The duplicate candidate points at a stale restored entry holding a closed
+connection. Not yet confirmed; to be reproduced with instrumentation before
+any fix. It bears directly on plain-partition coverage: a runner that also
+remounts p2 would make every remount this two-drive case.
+
+A Samsung M30 run on the same build, with VC+exFAT and VC+FAT32 attached
+through a hub, was force-stopped and is not logged: the exFAT drive's transport
+died during `write verify` (`MAX_RECOVERY_ATTEMPTS Exceeded`), and the run then
+sat in `unaligned` against the dead handle for nine minutes. No result. That
+drive is to be checked on the host before anything else touches it.
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit 6c58cd4 — drive D p1, VeraCrypt + ext4
+
+Clean tree, awake and unthrottled at both ends. The first run on this card after
+`4ea6a49` made the report writer and `benchFixtures` resolve by tag rather than
+by position — the A/B for the host result logged below it, where six reports had
+landed on the wrong partition.
+
+| Field | Value |
+|---|---|
+| Drive | Realtek card reader, 11927 MiB — VeraCrypt (AES/SHA-512, PIM 1) + ext4, `VCEXT4` |
+| Report | `otgbench-ANE-LX1-20260929-063359.txt` |
+| seq read | 6.61 / 6.72 / 6.71 MB/s (32 / 128 / 512 KiB buf) |
+| write | 16 MiB → 1.62 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+
+**Host check (laptop, after the run):**
+
+| Partition | `e2fsck` / compare |
+|---|---|
+| p1 VeraCrypt + ext4 | **CLEAN**. Only this run's report added and `INDEX.txt` modified; free blocks 2368221 → 2368220, free inodes 743997 → 743996 — one file's worth. The script's verdict reads `CHANGES FOUND` because superblock and `dumpe2fs` differ, which the counters above account for. |
+| p2 plain ext4 | **CLEAN**, compare **NO CHANGE**. Before `4ea6a49` this partition received every report; now it receives none. |
+| p3 NTFS | `Android/data/` added (8 entries, incl. `.nomedia`, `com.huawei.appmarket/`, `com.huawei.systemmanager/`), all timestamped 06:25:00–01 — the moment the card was inserted, nine minutes before this report. **Written by EMUI, not OTG Master:** Huawei's Android 9 mounts NTFS natively and scaffolds `Android/data` on any volume it mounts. |
+
+The p3 result limits what the NTFS baseline can show: on a phone whose OS
+mounts NTFS itself, "p3 unchanged" cannot be used to prove the app never
+writes NTFS. The app-side claim rests on the partition being refused — it is
+filtered from the picker and never opened. The p3 baseline is not being
+retaken: NTFS is unsupported, so future compares of p3 are skipped rather than
+re-armed against the OS's own writes.
+
+The report's placement is the result this run was for: it is on p1, the drive
+measured, and not on p2. `4ea6a49` is confirmed on hardware.
+
+---
+
+## 2026-09-28
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit dc29660 — VeraCrypt + FAT32
+
+Awake and unthrottled at both ends. Full run completed successfully on the device.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `otgbench-ANE-LX1-20260928-223833.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.65 / 5.46 / 7.16 / 7.92 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 1.49 / 3.74 / 3.80 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 11.2 ms each, 89.1 IOPS |
+| dir listing | dense_short cold 1316.4 / warm 455.3 ms; dense_lfn cold 1643.5 / warm 441.3 ms |
+| opens | short 452.5 ms each, lfn 464.8 ms each |
+| write | 16 MiB → 0.98 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | **FAILED — "FATs differ" (exited 1)**; structurally intact, failure is solely due to the known mirror bug |
+| baseline compare | **CLEAN** — exactly 2 files added (the reports), FAT0 changed by only 11 bytes, FAT1 identical. **Massive data corruption is completely gone.** |
+
+---
+
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 4ea6a49 — LUKS1/2 + FAT32/exFAT, manifests regenerated
+
+Clean tree, awake and unthrottled. The first run of this drive after its
+manifests were regenerated with the fixed `prepare_drive_a.sh` logic, and the
+first with `benchFixtures` and the report writer resolving by tag.
+
+| Partition | write verify | unaligned | correctness | fixtures |
+|---|---|---|---|---|
+| P1 LUKS1 + FAT32 | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P2 LUKS1 + exFAT | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P3 LUKS2 + FAT32 | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+| P4 LUKS2 + exFAT | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | **ALL 4 MATCHED** |
+
+Every section on every partition — against a drive that the day before gave a
+result for its first partition only, and this morning failed fixtures on all
+four.
+
+What this run cannot show on its own: the four partitions carry identical
+fixtures, so a pass does not say which partition each fixtures section read. The
+host compare can, because the report writer now puts a copy on every drive the
+run measured — each of the four should carry this run's report.
+
+**Host check (laptop, after the run):**
+
+| Partition | fsck | Compare against the pre-run baseline |
+|---|---|---|
+| P1 LUKS1 + FAT32 | **CLEAN** — 20025 files, 86191/4185352 clusters | report added, `INDEX.txt` modified; FAT[0] and FAT[1] **each 13 bytes at byte 558,685, identical** (V9); FSInfo 3 bytes. First attempt was lost to a script edited mid-run; re-run afterwards. |
+| P2 LUKS1 + exFAT | **CLEAN** — 17 dirs, 20006 files | report added, `INDEX.txt` modified; boot region and FAT identical. The script printed `NO CHANGE` despite listing the two — the verdict bug fixed in `f8b8042`. |
+| P3 LUKS2 + FAT32 | **CLEAN** — 20022 files, 86184/4182026 clusters | report + `INDEX.txt` added; FAT[0] and FAT[1] **each 17 bytes at byte 394,473, identical** (V9); FSInfo 3 bytes |
+| P4 LUKS2 + exFAT | **CLEAN** — 17 dirs, 20006 files | report added, `INDEX.txt` modified; boot region identical; FAT ~4,081 entries changed |
+
+The report landed on every partition the run measured (all four confirmed), so each partition's `fixtures` pass is now
+attributable to it.
+
+P4's FAT churn is consistent with the run, not with damage: the 16 MiB write
+test is 4,096 × 4 KiB clusters, and exFAT only writes FAT entries for a
+fragmented file. It leaves them stale when the file is freed, which `fsck.exfat`
+accepts. The allocation bitmap was not captured, so this is plausible rather
+than proven.
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit eb26e3e — VeraCrypt + FAT32
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends. FAT32 on a third device, after both FAT fixes.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| block read | 2.81 / 16.55 / 14.82 / 15.90 MB/s |
+| seq read | 3.83 / 9.21 / 9.27 MB/s |
+| random read | 10.8 ms each, 92.7 IOPS |
+| write | 16 MiB → 1.28 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `fsck.fat`, no "FATs differ" |
+| baseline compare | 2 reports added (this run's and the Huawei run at 05:52, both since the baseline), `INDEX.txt` modified; **FAT[0] and FAT[1] each 14 bytes at byte 57,000,901, identical**; FSInfo 3 bytes |
+
+V9 on a second device: both FAT copies written, byte for byte the same. The
+compare spans two runs, so the 14 bytes are the two runs combined.
+
+---
+
+### SD card (drive D) — host verification after its Huawei runs
+
+Checked on the laptop against baselines taken before the six Huawei runs of
+2026-09-28 (21:02–21:44). Every run measured the VeraCrypt partition only.
+
+| Partition | `e2fsck` | Compare |
+|---|---|---|
+| p1 VeraCrypt + ext4 | **CLEAN** | **no files changed**; free blocks and free inodes unchanged |
+| p2 plain ext4 | **CLEAN** | 6 reports added, `INDEX.txt` modified; 6 blocks, 6 inodes |
+
+Both partitions are healthy, and every change on each is accounted for — but the
+reports are on the wrong one. The runner wrote each run's report to whichever
+volume was first in the mount list at the end, and the app had re-mounted the
+plain partition on its own. Fixed in the same commit as this row: reports now go
+to the drive the run measured, resolved by tag.
+
+On p1 the one metadata change is group 0's unused-inode count, 8107 → 8103, with
+free inodes unchanged. `bg_itable_unused` is a high-water mark: allocating
+inodes lowers it and freeing them does not raise it. The runs created and deleted
+their scratch files, leaving exactly that trace, and `e2fsck` agrees it is
+consistent.
+
+Also: this card's earlier `fixtures: ALL 5 MATCHED` on the Huawei may have been
+read from p2 rather than p1 — `benchFixtures` resolved by position until this
+commit, and both partitions carry identical fixtures, so the pass does not say
+which. p1's health is not in question; the compare above shows it untouched.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.4.0 (46) commit 3b03bae — VeraCrypt + FAT32, mirror fix
+
+**The hardware confirmation of V9 (`149b2d2`) — the first FAT32 drive written by
+this app to pass `fsck.fat` outright.** Before the run the drive's two FATs had
+been resynced with `fsck.fat -a` and a fresh baseline taken, so any divergence
+afterwards could only come from this build.
+
+Report label reads `3b03bae-dirty`; the dirt was an untracked report file in the
+repo root, since ignored in `5f00fd0`. The code is exactly `3b03bae`, which
+carries V8 and V9.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| block read | 2.05 / 6.95 / 7.95 / 8.20 MB/s |
+| seq read | 1.51 / 3.77 / 3.73 MB/s |
+| random read | 16.7 ms each, 59.9 IOPS |
+| write | 16 MiB → 1.15 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `fsck.fat`: 20087 files, 14241971/15113321 clusters, no "FATs differ" |
+
+Against the baseline taken before the run:
+
+| Region | Change |
+|---|---|
+| files | 1 added (the report), 1 modified (`INDEX.txt`) — both runner output |
+| FAT[0] | 7 bytes at byte 57,000,901, ~1 entry |
+| FAT[1] | **7 bytes at byte 57,000,901, ~1 entry — identical to FAT[0]** |
+| reserved | 3 bytes at offset 1000 — the FSInfo free-cluster count |
+
+The previous run on this drive, before V9, showed FAT[0] changed and FAT[1]
+byte-identical to its baseline — never written. Here both change, by the same
+bytes at the same offset.
+
+Taken together with the run before it, both libaums FAT32 defects fixed in this
+release are now confirmed on the hardware that exposed them: V8 (a corrupt chain
+no longer wipes unrelated clusters) and V9 (every FAT copy is written).
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.4.0 (46) commit 5f00fd0 — drive A, all four partitions
+
+Clean tree, installed immediately before the run, awake and unthrottled at both
+ends, battery 100%. All four partitions in one pass.
+
+| Partition | seq read (512 KiB) | write verify | unaligned | correctness | fixtures |
+|---|---|---|---|---|---|
+| P1 LUKS1 + FAT32 | 11.58 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | 3 of 3 FAILED |
+| P2 LUKS1 + exFAT | 11.06 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | 3 of 3 FAILED |
+| P3 LUKS2 + FAT32 | 11.09 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | 3 of 3 FAILED |
+| P4 LUKS2 + exFAT | 11.28 MB/s | **ALL PASSED** | **A + B PASS** | **ALL PASSED** | 3 of 3 FAILED |
+
+**The multi-partition path works.** On the Samsung the day before, the same
+drive gave a result for its first partition only; every section on partitions
+2–4 failed with `block device is closed (volume was unmounted)`. That run is what
+exposed the three runner defects fixed in `6df73db` (stale references across
+drives), `d216ed8` (within one drive) and `dc29660` (the remount check racing the
+app's own auto-mount). This is the A/B for all three on the drive that found them.
+
+**The fixtures failures are a manifest bug, not the drive.** All four partitions
+report byte-identical results — `dense_short/` and `dense_lfn/` "LISTING
+DIFFERS" with the same expected and actual hashes, and
+`nested/leaf_at_depth_10.dat missing`.
+
+*Correction, same day:* the identical results are **not** evidence on their own.
+`benchFixtures` still resolved its volume by position — the fix meant for it in
+`6df73db` had landed in `benchUnaligned` instead — so all four sections read the
+same partition and this is one comparison reported four times. The conclusion
+survives because the cause was found independently in the script itself: the
+cause is `prepare_drive_a.sh`, which wrote the
+manifest two ways its siblings had already been corrected away from: it hashed
+the directory listings including a trailing newline, where the benchmark joins
+entries with `\n` as a separator, and it recorded the leaf as
+`nested/leaf_at_depth_10.dat` when the file is ten directories deeper. Fixed in
+the same commit as this row. The drive's manifests need regenerating before its
+fixtures verdicts mean anything; its file contents have not been shown to be
+wrong.
+
+Host fsck on all four partitions is still outstanding — in particular the two
+exFAT ones, which threw `EIO` on the Samsung and have never been checked since.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit dc29660 — VeraCrypt + FAT32, re-prepared drive
+
+**The hardware confirmation of the FAT chain fix (V8, `f514eac`).** Same device
+and same container/filesystem as the run that found the corruption, on a drive
+re-prepared with `prepare_vc_fat32.sh --fill-to-free 4` and baselined before
+the run.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT`, filled to ~4 GiB free |
+| Report | `otgbench-ANE-LX1-20260928-223833.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.65 / 5.46 / 7.16 / 7.92 MB/s |
+| seq read | 1.49 / 3.74 / 3.80 MB/s |
+| random read | 11.2 ms each, 89.1 IOPS |
+| write | 16 MiB → 0.98 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | exit 1 — `FATs differ but appear to be intact. Using first FAT.` Nothing else. |
+| baseline compare | see below |
+
+Against the baseline taken before the run:
+
+| Region | Change | Accounted for by |
+|---|---|---|
+| files | 2 added, 0 modified, 0 removed | the report and `INDEX.txt` (fresh drive, so the index is new) |
+| FAT[0] | 11 bytes, ~2 entries | the clusters for those two files |
+| FAT[1] | identical | libaums never writes it |
+| reserved sectors | 3 bytes at offset 1000 | FSInfo free-cluster count (sector 1, field at 488) |
+
+Set against the run that found the damage — same device, same filesystem, the
+full suite — FAT[0] went from roughly 131,636 changed entries to about 2, entry 0
+from zeroed to untouched, and unexplained file changes from a destroyed 1 GiB
+fixture to none. `fsck.fat` went from free clusters inside chains, a truncated
+file and 720 MB reclaimed, to a single complaint.
+
+That remaining complaint is the mirror defect, left open on purpose: fixing it
+while the free path could still zero entries would have written the damage into
+the only surviving good copy. With V8 now confirmed here, it is safe to fix, and
+after it a FAT32 volume the app has written should be `fsck.fat`-clean outright.
+
+D4-C1 is reinstated.
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.3.13 (46) commit dc29660 — VeraCrypt + exFAT
+
+APK sha256 `cd657759…`, clean tree, installed immediately before the run,
+awake and unthrottled at both ends.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| seq read | 10.77 / 10.97 / 10.85 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck / compare | pending |
+
+Second device to exercise the remount race fix. The log shows the same shape as
+on the Huawei — the unmount completes in 12 ms and the app re-mounts the drive
+412 ms later — and the latched check caught the empty window, so correctness ran
+and passed.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit dc29660 — drive D, VeraCrypt + ext4
+
+The fourth attempt at this cell, and the first to pass. Sections `write`,
+`unaligned`, `correct` only — the read sections were measured on an earlier
+attempt and are unchanged.
+
+| Field | Value |
+|---|---|
+| Drive | Realtek card reader, 11927 MiB — VeraCrypt (AES/SHA-512, PIM 1) + ext4, `VCEXT4` |
+| write verify | **ALL PASSED** — cached, cache-dropped, **and remounted** |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+
+The A/B for `dc29660`. The three preceding attempts, on `6da214b`, `d216ed8` and
+`99c4ab3`, all reported `verify (remounted): NOT PERFORMED` and lost the
+remount-dependent sections. Same drive, same device, same command.
+
+The cause was never a slow unmount. Instrumenting it showed the unmount
+completing in 7 ms and the app re-mounting the still-attached drive 24 ms later
+on its own; the benchmark's 300 ms poll never saw the gap and concluded the
+volume had not unmounted. Two earlier fixes aimed at the consequences of that.
+
+---
+
+### Samsung Galaxy M30 — VeraCrypt + exFAT, verified against its baseline
+
+The run itself is recorded below. This is its post-run verification, and it is
+the clearest demonstration so far of what the baseline tool adds:
+
+| | |
+|---|---|
+| `fsck.exfat` | **CLEAN** — 19 directories, 20,097 files |
+| files changed | **none** beyond the runner's own report and `INDEX.txt` |
+| boot region | **identical** |
+| FAT | **7 bytes of 60,817,408 differ — about one entry** |
+
+One allocation-table entry moved, for the one file the run wrote.
+
+Set against the FAT32 drive measured by the same tool earlier the same day —
+526,547 bytes and roughly 131,636 entries changed, entry 0 zeroed, and an
+unrelated `FILL/` file's chain destroyed — the two are four orders of magnitude
+apart. Both drives passed every on-device check. Only this comparison
+distinguishes them.
+
+---
+
+### OnePlus 7 (GM1901) · Android 16 (SDK 36) · build 0.3.13 (46) commit d216ed8 — LUKS2 + ext4
+
+APK sha256 `02312fe0…`, clean tree, awake and unthrottled, battery 92%.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59136 MiB — LUKS2 (Argon2id) + ext4, `LUKS2EXT4` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 7.41 / 26.02 / 28.19 / 26.51 MB/s |
+| seq read | 26.04 / 27.71 / 28.40 MB/s |
+| random read | 3.5 ms each, 284.7 IOPS |
+| write | 16 MiB → 0.78 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+
+Replaces this device's earlier LUKS2 result, which was measured on a build
+predating the ext4 metadata fixes and could not have gone into a tag report. The
+fastest reads in the fleet — 28.4 MB/s sequential against the Pixel's 16.5 on the
+same drive, which is a device difference and not a code one.
+
+---
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit d216ed8 — LUKS1 + ext4
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59150 MiB — LUKS1 (PBKDF2) + ext4, `LUKS1EXT4` |
+| block read | 1.26 / 13.39 / 19.32 / 22.26 MB/s |
+| seq read | 16.54 / 16.41 / 15.85 MB/s |
+| random read | 5.0 ms each, 199.9 IOPS |
+| write | 16 MiB → 0.62 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `e2fsck -fn`: 20039/3792896 files, 927643/15142400 blocks |
+| baseline compare | **CLEAN** — see below |
+
+**First pair of runs verified against a stored baseline.** Both this and the
+Pixel's LUKS2 run were baselined before the run and compared after, with
+`scripts/volume_baseline.sh`:
+
+| | LUKS2 + ext4 | LUKS1 + ext4 |
+|---|---|---|
+| files unchanged | 20,007 of 20,009 | 20,009 of 20,011 |
+| added | its own report | its own report |
+| modified | `BENCH/reports/INDEX.txt` | `BENCH/reports/INDEX.txt` |
+| free blocks | −1 | −1 |
+| free inodes | −1 | −1 |
+
+Every change is the benchmark's own output, and the metadata delta is exactly one
+file's worth. This is a materially stronger statement than `fixtures` can make on
+its own: that section covers 5 manifest entries, while this covers all ~20,000
+files. The FAT32 corruption lived precisely in that gap — in a `FILL/` file no
+manifest entry named.
+
+---
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.3.13 (46) commit d216ed8 — VeraCrypt + exFAT
+
+APK sha256 `02312fe0…`, clean tree, awake and unthrottled at both ends, charging.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 3.37 / 12.04 / 12.97 / 11.29 MB/s |
+| seq read | 9.73 / 9.91 / 10.01 MB/s |
+| random read | 6.2 ms each, 160.8 IOPS |
+| write | 16 MiB → 0.35 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | pending |
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit d216ed8 — drive D, VeraCrypt + ext4
+
+APK sha256 `02312fe0…`, clean tree, awake and unthrottled. **Partial — the
+remount-dependent sections were lost.**
+
+| Field | Value |
+|---|---|
+| Drive | Realtek card reader, 11927 MiB — VeraCrypt (AES/SHA-512, PIM 1) + ext4, `VCEXT4` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| seq read | 6.61 / 6.82 / 7.10 MB/s |
+| write verify | **PARTIAL — 2 of 3**; the remount pass was not performed |
+| unaligned | **FAILED** — `block device is closed (volume was unmounted)` |
+| correctness | **NOT RUN** — "no live mount" |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | pending |
+
+The drive was healthy throughout: `fixtures` hashed five entries against host
+values in the same run, after the two failures. What was lost was the *ability to
+judge* the write path, not the write path itself.
+
+Cause, and why this run still shows it: `remountAndProve` waited a flat 30 s for
+the unmount, gave up, and returned — and the unmount then landed anyway, moments
+later. The volume vanished after the function had concluded it had not, and
+nothing re-mounted it, because the mount request is only issued past that return.
+Fixed in `d7c8fcd`, which raises the budget to the 90 s already allowed for a
+mount and re-issues the mount request before bailing. This run predates that
+build.
+
+Two earlier attempts at this cell failed the same way, on `6da214b` and
+`d216ed8`. Both are recorded as this row rather than separately: same drive, same
+device, same failure, differing only in which fix had landed.
+
+---
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit d216ed8 — LUKS2 + ext4
+
+APK sha256 `02312fe0…`, clean tree, awake and unthrottled at both ends.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59136 MiB — LUKS2 (Argon2id) + ext4, `LUKS2EXT4` |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-211430.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 2.36 / 11.38 / 19.28 / 23.32 MB/s |
+| seq read | 16.47 / 16.64 / 16.48 MB/s |
+| random read | 4.2 ms each, 240.1 IOPS |
+| write | 16 MiB → 0.64 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** (host check 2026-09-29, after the drive's later runs): `e2fsck` clean; compare against the baseline shows only this run's report, the 2026-09-28 21:14 Pixel / 21:28 OnePlus pair, and `INDEX.txt`; free blocks and inodes down by exactly 2. |
+
+Completes the Pixel's row: all six cases now measured on that device. It is also
+the first run on `d216ed8`, and it passed the sections that fail on the Huawei —
+which is consistent with the diagnosis there being a timeout tuned on fast
+hardware rather than anything wrong with the code path itself.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit 98fae8f — LUKS2 + ext4
+
+APK sha256 `ee9188b0…`, clean tree, awake and unthrottled at both ends.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59136 MiB — LUKS2 (Argon2id) + ext4, `LUKS2EXT4` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 3.44 / 6.25 / 7.23 / 8.18 MB/s |
+| seq read | 6.81 / 6.70 / 6.79 MB/s |
+| random read | 8.4 ms each, 119.2 IOPS |
+| dir listing | dense_short cold 652.5 / warm 212.4 ms; dense_lfn cold 708.7 / warm 242.5 |
+| opens | short 216.8 ms each, lfn 231.3 ms each |
+| write | 16 MiB → 0.53 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | pending |
+
+Argon2id on the slowest device in the fleet, which is the case this cell exists
+for: LUKS2's key derivation is memory-hard, and `prepare_drive_c.sh` pins
+`--pbkdf-memory 65536` precisely because cryptsetup's desktop default of 1–4 GB
+gets the process killed by Android's low-memory killer. It unlocked and ran
+through without incident here.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit 98fae8f — exFAT
+
+APK sha256 `ee9188b0…`, clean tree, awake and unthrottled at both ends, over WiFi.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 2.32 / 7.72 / 9.04 / 8.58 MB/s |
+| seq read | 6.54 / 6.77 / 6.69 MB/s |
+| random read | 10.3 ms each, 97.0 IOPS |
+| dir listing | dense_short cold 5460.3 / warm 433.9 ms; dense_lfn cold 8689.6 / warm 81.1 |
+| opens | short 64.3 ms each, lfn 82.9 ms each |
+| write | 16 MiB → 0.41 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `fsck.exfat`: 19 directories, 20096 files |
+
+**The cell this fleet most needed.** This is the device whose 0.43 MB/s writes
+exceeded the ten-second `FinalizerWatchdogDaemon` budget and killed the process,
+which is why `ExFatFileSystem.pendingReleases` exists. It ran the full exFAT
+suite — including hashing `seq_2g.bin` end to end over 329 s and two
+10,000-entry listings — with no kill and no failure. The mechanism is exercised
+on the hardware that broke it, not merely on faster phones where it never fired.
+
+Its 0.41 MB/s write is the slowest figure in the log and is a device
+characteristic, not a regression.
+
+---
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.3.13 (46) commit 98fae8f — LUKS1
+
+APK sha256 `ee9188b0…`, clean tree, awake and unthrottled at both ends.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59150 MiB — LUKS1 (PBKDF2) + ext4, `LUKS1EXT4` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.64 / 5.36 / 10.87 / 10.47 MB/s |
+| seq read | 10.64 / 10.30 / 10.59 MB/s |
+| random read | 6.2 ms each, 161.6 IOPS |
+| write | 16 MiB → 0.45 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `e2fsck -fn`: 20038/3792896 files, 927642/15142400 blocks |
+
+Unlike this device's LUKS2 run earlier, this one was awake from the start, so
+its throughput is usable. Against that LUKS2 run — same device, same session,
+block-layer control 10.47 against 10.88 MB/s, 4% apart and therefore comparable —
+LUKS1 reads slightly faster (10.6 against 10.0 MB/s sequential) and writes
+slightly slower (0.45 against 0.56 MB/s). Both differences are small enough to be
+run-to-run noise on a phone this slow; neither should be quoted as a LUKS1/LUKS2
+finding without repeats.
+
+---
+
+### Samsung Galaxy M30 (SM-M305F) · Android 10 (SDK 29) · build 0.3.13 (46) commit 98fae8f
+
+APK sha256 `ee9188b0…`, clean tree, on battery at 33%.
+
+| Field | Value |
+|---|---|
+| Drive | PNY 59136 MiB — LUKS2 (Argon2id) + ext4, `LUKS2EXT4` |
+| Report | `otgbench-SM-M305F-20260928-192923.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.89 / 5.33 / 11.93 / 10.88 MB/s |
+| seq read | 9.99 / 9.82 / 10.01 MB/s |
+| random read | 6.9 ms each, 144.0 IOPS |
+| dir listing | dense_short cold 470.0 / warm 152.3 ms; dense_lfn cold 494.0 / warm 161.3 |
+| opens | short 143.1 ms each, lfn 152.8 ms each |
+| write | 16 MiB → 0.56 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED the host-computed hashes** |
+| fsck | **CLEAN** — `e2fsck -fn`: 20035/3784704 files, 927120/15138816 blocks |
+
+**Throughput from this run is not usable.** It began with the screen off:
+
+```
+power : interactive=false deviceIdle=false powerSave=false
+*** DEVICE IS IDLE OR THROTTLED — throughput here is not comparable
+```
+
+The screen was woken about a minute in and the end-of-run block reads
+`interactive=true`, so it recovered — but it did not start clean, and a run that
+spent its first minute throttled cannot have its figures compared with anything.
+The verdicts are unaffected: every one of them is a hash or structural
+comparison rather than a measurement.
+
+---
+
+### Huawei P20 Lite (ANE-LX1) · Android 9 (SDK 28) · build 0.3.13 (46) commit 98fae8f
+
+APK sha256 `ee9188b0…`, clean tree, awake and unthrottled at both ends, on
+battery. Driven entirely over WiFi — see the note below.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `otgbench-ANE-LX1-20260928-192814.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.63 / 6.13 / 7.87 / 8.06 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 1.50 / 4.00 / 3.90 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 17.5 ms each, 57.2 IOPS |
+| dir listing | dense_short cold 4834.9 / warm 1733.2 ms; dense_lfn cold 2550.9 / warm 588.5 |
+| opens | short 1265.9 ms each, lfn 466.0 ms each |
+| write | 16 MiB → 1.83 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | not yet run — drive still on the phone |
+
+First completed case on this device. It is the slowest of the four by a wide
+margin — 8.06 MB/s block read against the Pixel's 35.33, and hashing `seq_2g.bin`
+took 432 s at 4.74 MB/s against the Pixel's 65 s. Those figures are a device
+characteristic, not a regression: `IO_PERFORMANCE.md` already records this phone
+at roughly a quarter to a fifth of the others.
+
+**`adb tcpip` over WiFi survived unplugging USB on this Android 9 device.**
+`RUNNING_BENCHMARKS.md` states that legacy `adb tcpip` "does not survive losing
+the USB transport", and steers Android ≤10 devices to the on-device OTG Bench
+flow, which cannot verify on-disk correctness because backgrounding MainActivity
+nulls the mount handlers. This entire run — install, mount, benchmark, remount
+for the correctness section — was driven over `192.168.1.17:5555` with the cable
+out, so that guidance is at least not universally true. Worth re-testing before
+the doc is rewritten, since one success does not disprove a flaky behaviour.
+
+---
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit e78cf0a — FAT32
+
+APK sha256 `2db42f29…`, clean tree, awake and unthrottled, on a powered hub.
+**The reference VeraCrypt+FAT32 run** — first complete one with every section
+passing.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-190012.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 2.02 / 16.92 / 29.68 / 32.59 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 9.70 / 22.59 / 22.56 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 7.1 ms each, 141.4 IOPS |
+| dir listing | dense_short cold 743.0 / warm 249.1 ms; dense_lfn cold 915.0 / warm 112.0 |
+| opens | short 306.2 ms each, lfn 121.2 ms each |
+| write | 16 MiB → 1.91 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | not yet run — drive still on the phone |
+
+First FAT32 run with working fixture hashing: three large files read end to end
+(`seq_2g.bin` 78.0 s at 26.25 MB/s), two 10,000-entry listings, eleven nested
+files. Both prerequisites landed today — the manifest had no hashes until
+`regen_manifest.sh` was generalised, and the section that checks them was broken
+until `e78cf0a`.
+
+**Not comparable to the `d455547` FAT32 run.** Its write figure was 0.59 MB/s
+against 1.91 here, which looks like a large improvement and is not a measurement
+of one: the block-layer controls differ by 7% (32.59 against 35.09 MB/s at
+4096 KiB), which is past the threshold this project treats as comparable, and
+the earlier run was made on a phone at 21% battery powering the drive from its
+own cell. Nothing in the code between those builds touches the FAT32 write path.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit e78cf0a
+
+APK sha256 `2db42f29…`, clean tree, awake and unthrottled throughout, on a
+powered hub. **The reference VeraCrypt+exFAT run** — the first complete one with
+every section passing.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-185058.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| freeSpace | first 101.8 ms, then 68.6 ms avg |
+| block read | 3.09 / 26.90 / 35.37 / 35.33 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 30.07 / 31.24 / 31.27 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 2.6 ms each, 385.8 IOPS |
+| dir listing | dense_short cold 1203.6 / warm 13.7 ms; dense_lfn cold 2057.5 / warm 20.0 |
+| opens | short 12.0 ms each, lfn 16.1 ms each |
+| write | 16 MiB → 0.63 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | `fsck.exfat` CLEAN earlier the same day (19 dirs, 20091 files) |
+
+The fixture hashes are the part worth noting: three large files read end to end
+and hashed (`seq_1g.bin` 33.1 s, `seq_2g.bin` 64.9 s, `seq_256m.bin` 8.0 s at
+~31 MB/s), two 10,000-entry directory listings, and eleven files down the nested
+tree — all matching hashes computed on the host. This drive had **no** fixture
+hash coverage at all until `regen_manifest.sh` was generalised, and the section
+that checks them was broken until `e78cf0a`.
+
+Block-layer control at 4096 KiB is 35.33 MB/s here against 36.25 on `110e1cd`,
+a 2.5% difference, so the two runs are comparable and nothing regressed.
+
+---
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit e78cf0a — fixtures only
+
+APK sha256 `2db42f29…`, clean tree. The first verification run for the `fixtures`
+fix, superseded by the full run above but kept because it is the A/B pair.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-184209.txt` |
+| Sections | fixtures |
+| fixtures | **ALL 16 MATCHED the host-computed hashes** |
+| fsck | `fsck.exfat` CLEAN earlier the same day (19 dirs, 20091 files) |
+
+This is the same drive and the same section that reported
+`FAILED java.io.IOException: File is closed` on `110e1cd`. The fix is closing the
+handle after the last read of it rather than before. Confirmed on hardware: the
+section fails on the old build and passes on the new one.
+
+**Throughput from this run is not usable.** The runner flagged it:
+
+```
+power : interactive=true deviceIdle=false powerSave=true
+*** DEVICE IS IDLE OR THROTTLED — throughput here is not comparable
+*** to an awake run; wake the screen and disable Doze before measuring
+```
+
+The phone had dropped to 20% battery and Android turned on battery saver. That
+does not affect this run's verdict, which is a hash comparison rather than a
+measurement, but none of its MB/s figures are quoted anywhere and none should be.
+
+Before this run the drive had dropped off the USB bus entirely — `dumpsys usb`
+listed no device, and a benchmark attempt sat through its full 90 s mount timeout
+reporting `NO DRIVES MOUNTED`. Replugging restored it. The phone was powering a
+USB 3.2 stick from a 21% battery at the time, which is the most likely
+explanation. That attempt produced no result and is not logged as a run.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit 110e1cd
+
+APK sha256 `ab7f758f…`. Clean tree — the first run whose label names a tree it was
+actually built from.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-181659.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 2.25 / 24.88 / 34.74 / 36.25 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 29.96 / 30.79 / 31.20 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 2.5 ms each, 399.7 IOPS |
+| dir listing | dense_short cold 1256.4 / warm 15.9 ms; dense_lfn cold 1986.6 / warm 17.5 |
+| opens | short 12.6 ms each, lfn 16.5 ms each |
+| write | 16 MiB → 0.64 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **FAILED — `java.io.IOException: File is closed`** |
+| fsck | `fsck.exfat` CLEAN before this run (19 dirs, 20091 files) |
+
+The manifest had been regenerated with `regen_manifest.sh`, so this is the first
+time the fixture hashing ran on this drive at all. It aborts roughly 29 s into the
+first large file, and reproduces on its own with `--es tests fixtures` — so it is
+not an interaction with the remount that the correctness section performs.
+
+**This is not a regression from the commits under test.** The same section passes
+on the ext4 drives (`ALL 5 MATCHED`), which go through libaums; the failure is in
+`ExFatFile`, which none of today's commits touch, and it could not have been seen
+here before because the manifest carried no hashes to check against.
+
+Suspected cause, not yet proven: `ExFatFile.finalize()` sets `isClosed = true` and
+queues its native node for release. `search()` builds a fresh `ExFatFile` for every
+directory entry it walks past, so a single lookup litters the heap with wrappers
+over live nodes — and ART may finalize an object while a method on it is still
+running, which is what `Reference.reachabilityFence` exists for. A long read loop
+under GC pressure is exactly the shape that provokes it. If that is right the same
+failure is reachable from the DocumentsProvider, where copying a large file off an
+exFAT drive runs the same loop, so it is worth settling rather than working around.
+
+This run also confirms the `onDestroy` handler-ownership fix on hardware: the
+sequence that produced "no mount handler installed" twice — back out of
+MainActivity, relaunch, broadcast — mounted cleanly here.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit d455547
+
+APK sha256 `d1a9adc7…`. Label `d455547-dirty`; the dirt is six untracked scratch
+scripts, so the tracked tree matches `d455547` exactly. (`gitDirty()` runs
+`git status --porcelain`, which counts untracked files — worth knowing before
+reading any `-dirty` label as uncommitted *code*.)
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + FAT32, `VCFAT` |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-180144.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | — / 18.39 / 30.58 / 35.09 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 9.78 / 22.11 / 22.86 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 6.2 ms each, 160.0 IOPS |
+| dir listing | dense_short cold 786.9 / warm 310.4 ms; dense_lfn cold 821.8 / warm 110.3 |
+| opens | short 299.5 ms each, lfn 115.9 ms each |
+| write | 16 MiB → 0.59 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | not checked — manifest has no hashes (old prepare script) |
+| fsck | not yet run — drive still on the phone |
+
+Two earlier attempts at this run produced no result and are not logged: both died
+at `*** no mount handler installed — is MainActivity running? ***` with
+MainActivity visible and focused. That is the `onDestroy` ownership bug — a
+finishing instance nulling its successor's handlers — fixed in the same commit as
+this row.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46)
+
+APK sha256 `f9d3269c…`. Report label `6d33f88-dirty` — **built from a dirty tree**:
+the contents are `6d33f88` plus the UI fixes committed afterwards as `654ceda`.
+This is the run that prompted the commit-before-build rule.
+
+| Field | Value |
+|---|---|
+| Drive | PNY USB 3.2.1 FD, 59151 MiB — VeraCrypt (AES/SHA-512, PIM 1) + exFAT |
+| Report | `otgbench-Pixel_10_Pro_XL-20260928-174901.txt` |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 3.22 / 29.32 / 34.14 / 34.22 MB/s (4 / 64 / 512 / 4096 KiB span) |
+| seq read | 31.56 / 31.81 / 32.25 MB/s (32 / 128 / 512 KiB buf) |
+| random read | 2.5 ms each, 406.2 IOPS |
+| dir listing | dense_short cold 1227.9 ms / warm 13.7 ms; dense_lfn cold 1978.5 / warm 21.1 |
+| opens | short 12.6 ms each, lfn 18.6 ms each |
+| write | 16 MiB → 0.67 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | not checked — this drive's manifest predates the hash check |
+| fsck | **CLEAN** — `fsck.exfat` (exfatprogs 1.3.2): 19 directories, 20091 files |
+
+Regression check for `6d33f88` / `654ceda`. The volume still classifies as
+VERACRYPT, which is the case the classification change had to leave alone: a
+VeraCrypt header is random, so `FilesystemDetector` returns Unknown and the
+residual guess stands.
+
+### Pixel 10 Pro XL · Android 17 (SDK 37) · build 0.3.13 (46) commit cdd87b5
+
+Drive D (see `TEST_DATA.md` §11a), first hardware run of VeraCrypt+ext4 and of
+the plain-ext4 control.
+
+**p2 — plain ext4, `PLAINEXT4`, 8947 MiB** — report `…-20260928-173746.txt`
+
+| Field | Value |
+|---|---|
+| Commit | APK sha256 `d20bec6b…`, label `cdd87b5-dirty` — contents are `cdd87b5` plus the classification work later committed as `6d33f88`, without its `restoreDeferredCandidates` fix |
+| Sections | free, block, dir, path, seq, random, opens, write, unaligned, correct, fixtures |
+| block read | 1.57 / 44.08 / 48.09 / 50.16 MB/s |
+| seq read | 32.84 / 33.74 / 35.92 MB/s |
+| random read | 105.8 ms each, 9.45 IOPS |
+| dir listing | dense_short cold 175.7 / warm 65.5 ms; dense_lfn cold 285.0 / warm 72.9 |
+| opens | short 70.4 ms each, lfn 71.8 ms each |
+| write | 16 MiB → 0.99 MB/s |
+| write verify | **PARTIAL — 2 of 3 passes**; the remount pass was not performed |
+| unaligned | **NOT VERIFIED** — no remount |
+| correctness | **NOT VERIFIED** — no remount |
+| fixtures | **ALL 5 MATCHED** the host-computed hashes |
+| e2fsck | **CLEAN** — 20044/573440 files, 672300/2290432 blocks |
+
+The three `PARTIAL`/`NOT VERIFIED` verdicts are a runner limitation, not a result:
+those sections judge themselves after a remount, and the only remount path the
+runner has takes a password, so an unencrypted partition cannot be fully judged on
+the device. The host `e2fsck` covers it instead. See `RUNNING_BENCHMARKS.md`.
+
+**p1 — VeraCrypt (AES/SHA-512, PIM 1) + ext4, `VCEXT4`, 11927 MiB**
+
+| Field | Value |
+|---|---|
+| Report | `…-20260928-172852.txt` (write sections), `…-20260928-172532.txt` (reads) |
+| Commit | `cdd87b5-dirty`; the dirt was untracked scripts only, so the code matches `cdd87b5` |
+| Sections | reads in one run, then write, unaligned, correct, fixtures in a second |
+| block read | 1.24 / 17.59 / 26.98 / 33.01 MB/s |
+| seq read | 25.28 / 26.72 / 25.51 MB/s |
+| random read | 4.8 ms each, 209.3 IOPS |
+| dir listing | dense_short cold 150.2 / warm 49.2 ms; dense_lfn cold 341.0 / warm 52.1 |
+| opens | short 68.3 ms each, lfn 74.1 ms each |
+| write | 16 MiB → 3.05 MB/s |
+| write verify | **ALL PASSED** (cached, cache-dropped, remounted) |
+| unaligned | **A + B PASS** |
+| correctness | **ALL PASSED** (A–G) |
+| fixtures | **ALL 5 MATCHED** the host-computed hashes |
+| e2fsck | **CLEAN** — 20035/764032 files, 685283/3053504 blocks |
+
+**Do not read p1 against p2 as an A/B.** Their block-layer controls differ (33.0 vs
+50.2 MB/s at 4096 KiB), which by this project's own rule means the arms are not
+comparable — p1 ran on a fresh mount, p2 on a long-lived one. The crypto layer
+costs something here; these numbers do not measure how much.
+
+The first p1 run (`…-172532.txt`) omitted `--es tests` and therefore ran the
+read-only sections only. It is listed because it happened, not because it proves
+anything about the write path.
+
+### OnePlus 7 · Android 16 · LUKS2 + ext4
+
+| Field | Value |
+|---|---|
+| write | ALL PASSED, 0.73 MB/s |
+| correctness | ALL PASSED |
+| fixtures | ALL 5 MATCHED |
+| e2fsck | CLEAN |
+
+### Pixel 10 Pro XL · Android 17 · LUKS1 + ext4
+
+| Field | Value |
+|---|---|
+| write | ALL PASSED, 0.82 MB/s |
+| correctness | ALL PASSED |
+| fixtures | ALL 5 MATCHED |
+| e2fsck | CLEAN |
+
+### OnePlus 7 · Android 16 · LUKS1 + ext4
+
+| Field | Value |
+|---|---|
+| write | ALL PASSED, 0.76 MB/s |
+| correctness | ALL PASSED |
+| fixtures | ALL 5 MATCHED |
+| e2fsck | CLEAN |
+
+The three LUKS rows above are carried over from the runs that validated the ext4
+write fixes. They are recorded at the level of detail that was captured at the
+time — the per-section read figures were not, which is the gap this file exists to
+stop recurring.

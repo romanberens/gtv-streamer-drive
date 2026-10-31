@@ -1,0 +1,59 @@
+.gradle/
+build/
+captures/
+*.apk
+*.ap_
+*.aab
+*.iml
+.idea/
+local.properties
+.cxx/
+
+# Release signing secrets — never commit these
+keystore.properties
+*.jks
+*.keystore
+
+# Generated e2e test data (run generate_testdata.sh to create)
+testdata/**/*.img
+testdata/**/*.key
+testdata/**/pim.txt
+testdata/**/expects_error.txt
+testdata/**/expected_fs.txt
+testdata/**/cipher.txt
+testdata/**/hash.txt
+
+# Test run artifacts
+logcat_*.txt
+test_out.log
+session_summary.txt
+testdata/**/password.txt
+testdata/**/journal_blocks.txt
+testdata/**/boot.txt
+r*.log
+test.img
+*_strategy.txt
+
+# E2E test reports
+e2e_report_*.md
+logcat_*.txt
+
+# Agent artifacts
+agy/
+
+# Volume baselines: raw FAT copies are 57 MB each. The hash lists inside are
+# small and may be worth committing later; that is undecided.
+baselines/
+
+# Benchmark reports pulled off a device into the repo root. Untracked files make
+# the build stamp itself -dirty (gitDirty counts them), so a stray report would
+# mislabel every APK built after it.
+/otgbench-*.txt
+__pycache__/
+e2e_parallel_*/
+# Device-matrix drive builds and read-backs (scripts/build_matrix_drive.py): tens of GB
+matrix/
+# Manifests prepare_matrix_drive_macos.sh copies off the Mac-built volumes
+matrix-mac/
+# Unpacked from testdata/apfs/apfs-images.tar.xz
+testdata/apfs/apfs_*/

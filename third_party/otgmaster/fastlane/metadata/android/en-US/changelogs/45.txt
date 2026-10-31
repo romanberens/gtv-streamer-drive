@@ -1,0 +1,22 @@
+• Much faster browsing of encrypted drives: folders with thousands of files now open in about two seconds instead of nearly three minutes, and file reads are many times quicker
+• New: large exFAT drives now mount on devices that previously rejected them
+• Fixed: the app no longer crashes while listing a folder with many thousands of files
+• Fixed: the unlock form always appears now — it could previously go missing after an auto-mount prompt, leaving no way to unlock the drive
+• Fixed: a mounted drive is no longer disconnected by mistake while still in use, which could make it appear empty
+• Fixed: unmounting a drive while an app still had a file open could crash the app
+• Fixed: writing to a drive after it was unmounted could corrupt the volume; this is now blocked
+• Fixed: read errors on a damaged or unplugged drive are now reported instead of silently returning blank data
+• Fixed: data appended to a file on exFAT is immediately visible to other apps
+• Fixed: editing part of a file on a FAT32 drive no longer wipes the rest of the surrounding data — writes that did not land on an exact sector boundary were blanking up to 511 bytes beyond what was being written
+• Fixed: replacing the contents of a file on a FAT32 drive no longer corrupts it — the drive's directory could be left pointing at freed space, damaging that file and sometimes others
+• Fixed: reading a small file on a FAT32 drive could return leftover data from files you had deleted — it now returns only the file's own contents
+• Fixed: simply opening and closing a file on a FAT32 drive no longer writes to the drive, which wasted write cycles and slowed everything down
+• Fixed: files of 2 GB or larger now read correctly on FAT32 drives
+• Much faster file reading on FAT32 drives — large reads are now sent to the drive in one go instead of one small piece at a time
+• Fixed: a write to an exFAT drive that could not be completed in full is now reported instead of silently losing the remainder
+• Security: the volume's encryption keys are now wiped from memory as soon as they have been used, instead of lingering after the drive is unlocked
+• Fixed: opening a folder on a damaged drive no longer crashes the app — an implausible folder size is now rejected with an error
+• Fixed: if a folder cannot be read on an exFAT drive, the app now reports the error instead of showing the folder as empty
+• New: a Report issue button next to the log, which opens a feedback form pre-filled with your device and drive details — you choose exactly what to include, or nothing at all, and review it before anything leaves the app
+• Fixed: the app could close itself while tidying up after browsing a drive — most likely on slower drives, where the cleanup work took long enough for Android to intervene
+• Fixed: a mounted drive is no longer disconnected when the app's main screen is closed by Android in the background

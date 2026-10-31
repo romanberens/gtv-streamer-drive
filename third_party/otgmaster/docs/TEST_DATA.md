@@ -1,0 +1,1235 @@
+# Preparing test media and test data
+
+**This is the single reference for all test-media and test-case preparation** — E2E
+emulator images, physical VeraCrypt benchmark drives, and the LUKS drives. Everything
+needed to build a fixture from nothing is here or reachable from here; nothing else in
+the repo should carry a second copy of these commands.
+
+There are two kinds of test media, built for different questions, on different host
+platforms, at different scales. Picking the wrong one wastes the most time.
+
+| System | Script / section | Host | Size | Answers |
+|---|---|---|---|---|
+| **E2E volume images** | `scripts/generate_testdata.sh`, §2–§5 | Linux | 10 MB each | Does unlock + mount + basic I/O work? Is an unsupported choice *rejected*? |
+| **APFS E2E images** | `scripts/make_apfs_images_macos.sh`, §6b | macOS | 64 MB each | Plain and encrypted APFS, case-sensitive and not (not yet run by the suite) |
+| **VeraCrypt benchmark drive** | `scripts/prepare_test_usb.sh`, §7 | macOS | 62 GB | How fast is it, and does it stay correct under load? |
+| **LUKS drives (3 of them)** | §8–§12, manual | Linux | 64 GB each | LUKS1/LUKS2 header parsing, Argon2 on a phone, ext4 detection |
+| **Device-matrix drives (4)** | `scripts/build_matrix_drive.py` and friends, §16 | Linux (+ macOS for Drive 1) | 64 GB, 10 partitions each | Every container × filesystem on real hardware, ~3 GB read set and large writes per partition, verified on the host in one pass per drive |
+
+The E2E images are the ones to add first for any new cipher, hash or filesystem: they
+are cheap, they run on an emulator, and they cover the case that matters most for a new
+format — that the app either handles it correctly or refuses it cleanly.
+
+**If you are resuming this work, start at §13** — it is the checklist of what exists,
+what is missing, and what to do next.
+
+## 1. What the app supports today
+
+Adding test data for something the app cannot do is useful (that is the rejection
+case), but you need to know which side of the line you are on. The authority is
+`app/src/main/java/app/fayaz/otgmaster/veracrypt/VeraCryptCipher.kt`:
+
+**Ciphers** — every `VeraCryptCipher` entry is supported:
+
+| Cipher | Key material | `components` (VeraCrypt table order = encryption order) |
+|---|---|---|
+| AES | 64 bytes | AES |
+| Serpent | 64 bytes | Serpent |
+| Twofish | 64 bytes | Twofish |
+| AES-Twofish | 128 bytes | Twofish, AES |
+| Serpent-AES | 128 bytes | AES, Serpent |
+| Twofish-Serpent | 128 bytes | Serpent, Twofish |
+| AES-Twofish-Serpent | 192 bytes | Serpent, Twofish, AES |
+| Serpent-Twofish-AES | 192 bytes | AES, Twofish, Serpent |
+
+A cascade's name is the reverse of the order its ciphers are applied in: VeraCrypt
+builds the name from the last cipher of its table entry back to the first. `components`
+follows the table, because that is also the order of the keys in the header — every
+cipher's 32-byte primary key, then every cipher's 32-byte tweak key — and
+`keySizeBytes` is `components.size * 64`. Native ids (`SingleCipher.nativeId`, the
+`VC_CIPHER_*` ids in `app/src/main/cpp/vc_cascade.h`): AES 0, Serpent 1, Twofish 2.
+VeraCrypt's Camellia and Kuznyechik, and their cascades, are not offered.
+
+**Hashes** — SHA-512 (PBKDF2) and Argon2 (Argon2id, VeraCrypt 1.26.24 and later) are
+supported; SHA-256, Whirlpool and Streebog are listed so the picker can reject them by
+name rather than mis-deriving a key. `kdfNativeId` on `VeraCryptHash` is the switch.
+
+**Filesystems** — FAT32 (via the vendored libaums), exFAT (via vendored libexfat), ext4
+(written here) and, from 0.4.1, NTFS (via vendored libntfs-3g). FAT16 exists as a test
+case *specifically to prove it is refused*; the `ext4` and `ntfs` cases, which used to,
+now mount.
+
+**Containers** — VeraCrypt, LUKS1, LUKS2 and, from 0.4.1, BitLocker (version 2 —
+Windows 7 and later; password, recovery key or suspended protection). §6a builds the
+BitLocker fixtures.
+
+**PIM** matters more than it looks. `KdfParams.forVolume` follows VeraCrypt: for
+PBKDF2, `15000 + pim * 1000` iterations when a PIM is set, against `500000` when it is
+not; for Argon2id, 64 MiB plus 32 MiB per PIM step (capped at 1 GiB from PIM 31) and
+`3 + (pim - 1) / 3` passes, with no PIM meaning PIM 12 — **416 MiB and 6 passes**.
+Every fixture uses **PIM 1** — 16,000 iterations, or 64 MiB and 3 passes — because
+500,000 iterations of PBKDF2-SHA512 on a 1,248 MHz phone turns an unlock into a
+multi-minute wait, and 416 MiB is more than an emulator should be asked for. If you
+generate a fixture without `--pim`, expect the unlock to look hung rather than broken.
+
+VeraCrypt 1.26 refuses PIM 1 with a password shorter than 20 characters (it wants PIM
+485 for PBKDF2 or 12 for Argon2 then), so every fixture — the host ones and the E2E
+images — uses `otgmaster-test-password-2026`. The old `password123` images were made
+by an earlier VeraCrypt that did not check.
+
+### 1.1 Cipher and KDF fixtures for the host tests (no root)
+
+`app/src/test/resources/veracrypt/` holds one 1 KiB fixture per cipher × supported KDF
+(16), cut from volumes VeraCrypt formatted itself: the header sector, then the first data
+sector (a FAT boot sector). `VeraCryptCascadeTest` unlocks each through
+`VeraCryptUnlocker` and expects that boot sector back. Regenerate them with:
+
+```sh
+scripts/make_veracrypt_fixtures.sh      # veracrypt >= 1.26.24 on PATH; no root
+```
+
+It writes the VeraCrypt version used to `VERSION` beside them. Every run makes new keys,
+so the fixtures change completely each time; nothing may depend on their bytes. For a
+new cipher or KDF, add it to the two lists at the top of the script.
+
+### 1.2 Keyfile fixtures for the host tests (no root)
+
+`app/src/test/resources/veracrypt/keyfiles/` holds three volumes VeraCrypt made with
+keyfiles, cut the same way: no password with two keyfiles (one past the 1 MiB VeraCrypt
+reads), a 40-character password (the 64-byte keyfile pool) and a 70-character one (the
+128-byte pool). The keyfiles are not stored; both the script and `VeraCryptKeyfilesTest`
+generate them from the same formula. Regenerate with:
+
+```sh
+scripts/make_veracrypt_keyfile_fixtures.sh   # veracrypt on PATH; no root
+```
+
+## 2. The per-case contract (E2E images)
+
+`scripts/run_e2e_tests.sh` discovers cases by iterating `testdata/*/`, and reads these
+files out of each directory. Only the first three are mandatory:
+
+| File | Required | Meaning |
+|---|---|---|
+| `test.img` | **yes** | The raw image, `dd`'d onto the emulator's `/dev/block/sda` |
+| `password.txt` | **yes** | Volume password |
+| `pim.txt` | **yes** | PIM, as a bare integer |
+| `cipher.txt` | no | Which cipher the **UI picker** selects — not necessarily the volume's real cipher |
+| `hash.txt` | no | Which header KDF the **UI picker** selects (`SHA-512` if absent) — likewise independent of the volume |
+| `description.txt` | no | Printed in the run log; this is what a later reader has to understand the case from |
+| `test.key` | no | Keyfile; required by convention for any case named `*_keyfile` |
+| `expects_error.txt` | no | Presence means the case **must fail to mount** |
+| `write_test.txt` | no | Presence runs the create/persist/delete/persist lifecycle |
+| `disconnect.txt` | no | Presence runs the disconnect case (`E2EAutomatedTest.runDisconnectCase`): the drive is pulled while mounted (§6d) |
+
+`cipher.txt` and `hash.txt` being independent of the volume is the mechanism behind
+the `unsupported_hash` case: the image is ordinary AES/SHA-512 FAT32, but the picker is
+set to `Whirlpool`, so the app must refuse before touching volume data. That is the
+shape to copy for anything unsupported. (It was `unsupported_cipher`, with Twofish,
+until every cipher in the picker was implemented.)
+
+**One trap.** `ensure_testdata()` validates a **hardcoded list** of case names
+(`run_e2e_tests.sh:48`) while the run loop iterates the directory. A new case you add
+to `generate_testdata.sh` but not to that list will still *run* — it just will not be
+checked for missing artefacts, so a half-generated fixture fails later and less
+legibly. Add the name in both places.
+
+## 3. Adding a new cipher
+
+Work in this order. Steps 1–2 are app code; a fixture for an unimplemented cipher is
+only ever a rejection case.
+
+1. **Native.** Add a stage to `app/src/main/cpp/vc_cascade.cpp` and a
+   `VC_CIPHER_<NAME>` id to `vc_cascade.h`. Key schedules are built once per
+   `cryptSectorsInPlace` run, not per sector; a new cipher gets that for free.
+2. **Kotlin.** Add it to `SingleCipher` with that id, and add `VeraCryptCipher` entries
+   with `components` in **VeraCrypt's table order**, which is the reverse of the name.
+3. **Host fixture.** Add it to `scripts/make_veracrypt_fixtures.sh` (§1.1) and run it:
+   `VeraCryptCascadeTest` covers every `VeraCryptCipher` entry automatically.
+4. **E2E fixture.** `create_fat32_volume` already takes the cipher as its third
+   argument, so a standalone cipher is one line next to the existing Serpent case:
+
+   ```bash
+   create_fat32_volume "testdata/<name>" "false" "<VeraCryptCipherName>"
+   ```
+
+   The name must be what `veracrypt --encryption=` accepts. Add the directory to the
+   `mkdir -p` block at the top and to `ensure_testdata`'s list.
+5. **Rejection fixture**, if it is *not* implemented — copy the `unsupported_hash`
+   pattern: a working AES volume plus a `cipher.txt` naming the new cipher and an
+   `expects_error.txt`. This is the more valuable of the two cases, because a cipher
+   that is silently mis-decrypted looks like a corrupt drive to the user.
+6. **Cascades** need an image whose header actually uses the cascade, so
+   `--encryption="AES(Twofish)"`-style names must round-trip through VeraCrypt. Verify
+   the header parses to the full `keySizeBytes` before trusting a mount result.
+7. **Physical drive**, only once it mounts: `prepare_test_usb.sh --vc-encryption
+   <name>`. That flag already exists and is documented as "AES or Serpent"; widen the
+   comment when a third lands.
+
+**Serpent is the cautionary example.** It has been `isSupported = true` and has had a
+`testdata/serpent` fixture for some time, and **no benchmark run has ever exercised
+it** — every measurement in `docs/BENCHMARK_RESULTS.md` is AES/SHA-512. Supported, with
+a passing E2E case, is not the same as measured.
+
+## 4. Adding a new hash
+
+1. Implement it natively — a `KDF_*` id in `app/src/main/cpp/VeraCryptNative.cpp` — and
+   set the same id as `kdfNativeId` on its `VeraCryptHash` entry.
+2. Give it VeraCrypt's PIM rule in `KdfParams.forVolume`, from
+   `get_pkcs5_iteration_count` (or `get_argon2_params`) in VeraCrypt's
+   `src/Common/Pkcs5.c`. Check the default: a hash whose no-PIM cost differs from the
+   others is silently wrong if it falls into the `else`.
+3. Add it to `scripts/make_veracrypt_fixtures.sh` (§1.1); `VeraCryptCascadeTest` then
+   opens every cipher with it.
+4. For E2E, pass it as `create_fat32_volume`'s fifth argument; it is written to
+   `hash.txt`, which `run_e2e_tests.sh` passes to the picker.
+
+A fixture without `hash.txt` mounts because the app *defaults* to SHA-512 and the volume
+happens to be SHA-512 — a pass that proves nothing about the new hash.
+
+## 5. Adding a new filesystem
+
+Two code paths matter: detection, and the driver.
+
+1. **Detection.** `FilesystemDetector` decides what a decrypted volume is. It has JVM
+   unit tests that need no device — add the boot-sector signature case there first,
+   since it is the fastest feedback in the project.
+2. **Driver.** FAT32 goes through vendored libaums, exFAT through vendored libexfat
+   plus `ExFatNative.cpp`. A third means either another vendored library — which
+   requires an entry in `docs/VENDOR_FIXES.md` **before** the vendoring commit lands,
+   per `AGENTS.md` — or new code implementing `UsbFile`.
+3. **E2E fixture.** Two shapes exist, and the difference matters:
+   - **VeraCrypt formats it**: `--filesystem=<fs>`, as `create_exfat_volume` does.
+     Only works for filesystems VeraCrypt itself can create.
+   - **You format it**: `--filesystem=none`, mount the container to get a
+     `/dev/mapper/veracryptN` device, then `mkfs` onto that device, as
+     `create_fat32_volume` does. This is the general path, and the only one that gives
+     control over cluster size.
+
+   `create_unsupported_volume` is the third shape, for filesystems that must be
+   *refused* (`fat16`, `ntfs`, `ext4`). Note its ext4 branch skips file population —
+   there is a commented-out block at line 141 explaining why.
+4. **Benchmark fixture.** `prepare_test_usb.sh` validates `--fs` against a
+   `fat32|exfat` allowlist and maps it to a `diskutil` filesystem name; both need the
+   new case, plus a `newfs_*` invocation. Keep `--cluster 4096`: a small cluster size
+   inflates the FAT and allocation bitmap on purpose, which is the whole point of the
+   fixture.
+
+## 6. Adding a new container format
+
+A new *container* (LUKS1, LUKS2) is a larger change than a cipher, because it replaces
+header parsing and key derivation rather than a block transform: AF-split/merge,
+PBKDF2 vs Argon2id, master-key digest verification.
+
+`docs/LUKS_SUPPORT.md` is the design evaluation — it records seven gaps in the original
+proposal and the recommended scope for a first version. **The preparation commands live
+here**, in §8–§12, so there is one copy to keep correct.
+
+## 6a. NTFS in VeraCrypt and in BitLocker, ext4 in VeraCrypt (E2E, no root)
+
+`scripts/generate_noroot_testdata.sh` builds five E2E cases without sudo, unlike
+`generate_testdata.sh`:
+
+| Case | Container | Checks |
+|---|---|---|
+| `ext4` | VeraCrypt AES/SHA-512, PIM 1 | mount, flower.jpg through SAF (filled by `mkfs.ext4 -d`) |
+| `ntfs` | VeraCrypt AES/SHA-512, PIM 1 | mount, flower.jpg through SAF |
+| `ntfs_write` | VeraCrypt AES/SHA-512, PIM 1 | create/write/mkdir/delete, persisted over remounts |
+| `bitlocker_ntfs` | BitLocker AES-CBC-128 | BITLOCKER tag, mount, flower.jpg |
+| `bitlocker_ntfs_write` | BitLocker XTS-AES-128 | as `ntfs_write`; remount #2 uses the recovery key |
+
+```sh
+bash scripts/generate_noroot_testdata.sh
+```
+
+How each piece is made, and what vouches for it:
+
+- **NTFS**: `mkntfs`, populated through a user-mode `ntfs-3g` FUSE mount with the same
+  files the other mount cases carry.
+- **VeraCrypt**: `veracrypt --create --filesystem=none` (no root), then
+  `scripts/fill_veracrypt_volume.py` opens the header (PBKDF2-SHA512, AES-XTS) and
+  XTS-encrypts the NTFS into the data area. Decrypting it back independently gives a
+  clean NTFS with flower.jpg byte-identical.
+- **BitLocker**: only Windows creates BitLocker volumes, and cryptsetup's sample
+  images (vendored as test data, `app/src/test/resources/bitlk/`) have their unused
+  ciphertext zeroed, so the NTFS inside them is mostly noise. So
+  `scripts/make_bitlocker_image.py` builds one around a real NTFS, and `--verify`
+  makes cryptsetup the judge: it must parse the metadata, release the same volume
+  key for the password and the recovery key, and — through `scripts/bitlk_decrypt.py`,
+  which uses cryptsetup's key and layout with Python's AES — decrypt to exactly the
+  input. The generator keeps BitLocker's metadata in a tail after the NTFS (Windows
+  keeps it inside, as reserved files); `ntfsfix` then looks for the backup boot sector
+  in that zero tail, so cut a decrypted image to the NTFS size before running it.
+
+Password `password123`; BitLocker recovery key
+`111111-222222-333333-444444-555555-666666-111111-222222` (each group a multiple of
+11, and group/11 below 65536 — a random 48-digit string is not a valid key).
+
+## 6c. Format and Encrypt from a mounted card (E2E, no root)
+
+`scripts/make_erase_fixtures.py` builds the four cases `E2EAutomatedTest.testEraseOperations`
+runs, without sudo. Each starts holding the usual mount tree (flower.jpg, `file with
+spaces.txt`, …) so the test can see the old files go:
+
+| Case | Starts as | Action (from `erase.txt`) | Host check |
+|---|---|---|---|
+| `format_vc_exfat` | the `exfat` case's VeraCrypt AES/SHA-512 exFAT, 10 MB | Format, quick | decrypted in Python, `fsck.exfat`, flower.jpg gone, `after_erase.txt` present |
+| `format_plain_fat32` | plain FAT32, 64 MiB, label `OTGFAT32` | Format, full | `fsck.vfat`, label kept, files as above, no byte of the old flower.jpg left |
+| `encrypt_plain_fat32` | plain FAT32, 64 MiB | Encrypt: AES / SHA-512, PIM 1, exFAT inside, full | new header opened and decrypted in Python, `fsck.exfat`, files as above, no plaintext left |
+| `encrypt_plain_exfat` | plain exFAT, 64 MiB | Encrypt: Serpent-Twofish-AES / Argon2, PIM 1, FAT32 inside, full | no plaintext left, and the drive no longer reads as a filesystem |
+
+```sh
+python3 scripts/make_erase_fixtures.py      # writes test.img and password.txt (+ pim.txt for format_vc_exfat, disconnect)
+```
+
+- **The case files.** `erase.txt` holds `key=value` lines — `action` (format/encrypt),
+  `quick`, and for encrypt `cipher`, `hash`, `pim`, `fs` (exfat/fat32), `password`,
+  `label` — which `run_e2e_tests.sh` passes to the test as `-e erase_<key> <value>`.
+  `plain.txt` marks a volume that auto-mounts without a password.
+- **Images.** Plain ones come from `make_e2e_matrix.make_fs` (mkfs, then filled through
+  a `udisksctl` loop mount as this user). 64 MiB is the emulator's USB slot, and enough
+  for FAT32 — which needs 65,525 clusters; Windows decides the FAT type by cluster count
+  alone. The 10 MB VeraCrypt FAT32 fixtures are below that, and Format refuses them.
+- **What the app is checked against.** The test writes `after_erase.txt` on the new
+  volume; where the result is encrypted it unmounts and unlocks again with the password
+  it now has and reads the file back. `scripts/verify_e2e_volume.py` (it sees `erase.txt`)
+  then judges the drive without the app. No host tool decrypts Argon2 VeraCrypt volumes
+  (cryptsetup has no Argon2 for TCRYPT, and libsodium's Argon2 takes only 16-byte salts),
+  so the Argon2 cascade is opened in desktop VeraCrypt on Drive 5 (§16) instead.
+
+## 6d. A drive pulled while mounted (E2E, no root)
+
+The `disconnect` case is a copy of the `fat32` case (VeraCrypt AES/SHA-512, FAT32,
+10 MB), made by `scripts/make_erase_fixtures.py` beside the Format/Encrypt cases. It is
+encrypted because a plain volume's card has no Unmount, and the disconnected card has to
+be seen taking Open, Unmount and More away. Its `disconnect.txt` runs
+`E2EAutomatedTest.runDisconnectCase` (from `testMountUsbDrive`), which pulls the drive out while it is mounted, twice:
+
+- **Pulling it.** Every emulator starts with a QEMU monitor socket
+  (`/tmp/otg_qmon_<port>.sock`). The test touches `/data/local/tmp/otg_e2e_unplug` or
+  `…_replug`; `run_e2e_tests.sh` watches for those files during the case, runs
+  `device_del` / `device_add` on the USB drive, and removes the file once
+  `/dev/block/sda` has gone or come back. So the mounted volume's I/O really fails, as on
+  a phone.
+- **Telling the app.** The emulator has no USB host feature: the app reads the drive
+  through `/dev/block/sda`, not as a `UsbDevice`, and Android broadcasts no detach for it.
+  The test calls `OtgMasterState.detachRequest`, which runs the same handling as the
+  broadcast. The vendor:product matching in front of it is not exercised here, since the
+  emulator has one drive; `DetachMatchTest` covers that on the host.
+- **What it checks.** The first drop is on battery (`dumpsys battery`, 42%): the
+  DISCONNECTED card with no Open, Unmount or More, the warning banner and no green "Unmounted",
+  the recommendations leading with power, Dismiss, and the no-drive help after a Scan with
+  the drive out. The second is on external power: the advice leads with the cable, and
+  unlocking and mounting the volume again clears the card. After each re-mount the card's history
+  reads 1×, then 2×. `dumpsys battery reset` runs at the end, pass or fail.
+- **Before every case** the runner plugs the drive back in if it is missing, so a
+  disconnect case that fails half-way does not take the cases after it down too.
+
+## 6e. An ext4 drive whose journal needs recovery (E2E, no root)
+
+The `ext4_journal` case is plain ext4, 64 MiB with 4 KiB blocks and the usual mount
+tree plus `journal_replayed.txt` ("REPLAYED: no "), flagged `needs_recovery` with three
+committed transactions in a checksummed (CSUM_V3) journal — the format the kernel writes
+on a `metadata_csum` volume:
+
+1. the block of `journal_replayed.txt`, holding "REPLAYED: yes";
+2. a free block (the last one) filled with a pattern;
+3. a revoke of that free block.
+
+```sh
+python3 scripts/make_journal_fixture.py    # writes test.img, password.txt, journal_blocks.txt
+```
+
+- **How it is made.** `mkfs.ext4 -d`, then debugfs writes the transactions
+  (`jo -c` / `jw` / `jc`) without the kernel. debugfs uses e2fsprogs' copy of
+  `recovery.c`, the code the kernel and e2fsck replay with. This is the state a phone
+  leaves a plain ext4 drive in when Android has mounted it and OTG Master then claims
+  the USB device.
+- **What it checks.** `journal.txt` runs `E2EAutomatedTest.runJournalRepairCase`. The
+  drive mounts read-only and the repair dialog opens on its own. Before the repair,
+  `journal_replayed.txt` reads "no" and a create fails. "Keep read-only" leaves a Repair
+  button on the card. After the repair, the same file reads "yes", through the block cache
+  that already held the old block, and `after_repair.txt` is written and read back.
+- **Host check.** `scripts/verify_e2e_volume.py` (it sees `journal.txt`) runs e2fsck and
+  checks that `needs_recovery` is cleared and the journal is empty. It reads both files
+  with debugfs and confirms the revoked block is still zero, so a replay that ignores
+  revokes fails it.
+- **The replay itself** is checked on the host by `Ext4JournalReplayTest`. Each case
+  there replays one journal with debugfs (`jr`) and with the app's code, and requires
+  the two images to match block for block, with checksums and without, revokes and
+  uncommitted transactions included.
+
+## 6b. APFS (E2E images, macOS)
+
+`scripts/make_apfs_images_macos.sh` builds four raw images, each a GPT disk with one
+APFS partition — the layout Disk Utility gives a USB stick:
+
+| Case | Volume | Checks |
+|---|---|---|
+| `apfs_ci` | APFS, case-insensitive | mount, flower.jpg, case.txt and CASE.txt are one file |
+| `apfs_cs` | APFS, case-sensitive | as above, but case.txt and CASE.txt are two files |
+| `apfs_enc_ci` | APFS (Encrypted), case-insensitive | unlock with the password, then as `apfs_ci` |
+| `apfs_enc_cs` | APFS (Encrypted), case-sensitive | unlock with the password, then as `apfs_cs` |
+
+```sh
+bash scripts/make_apfs_images_macos.sh     # on a Mac, from the repo root
+```
+
+macOS only: no other OS creates natively encrypted APFS, and filling APFS on Linux
+needs the out-of-tree `linux-apfs-rw` module, which Secure Boot will not load unsigned.
+No root needed. Images land in `testdata/apfs/<case>/`, 64 MiB each. They sit one
+level below `testdata/` on purpose, so `run_e2e_tests.sh` does not pick them up until
+the app mounts APFS.
+
+**Unlike every other case, these are committed**, because Linux cannot rebuild them.
+The script also packs all four cases into `testdata/apfs/apfs-images.tar.xz` (about
+3 MB; the loose `test.img` files stay gitignored). `testdata/apfs/PROVENANCE.md`
+records where it came from and its hashes. A Linux checkout needs no Mac:
+
+```sh
+tar -xJf testdata/apfs/apfs-images.tar.xz -C testdata/apfs   # or let the verifier do it
+```
+
+After rebuilding on a Mac, commit the new archive and update the hashes in
+`PROVENANCE.md` in the same commit.
+
+The encrypted volumes are created encrypted (`diskutil apfs addVolume -passphrase`),
+not converted, so there is no background encryption to capture half-done. The script
+checks each volume's case behaviour before saving it. Password `password123`.
+
+**In the E2E suite** the four run as `testdata/apfs_ci`, `apfs_cs`, `apfs_enc_ci` and
+`apfs_enc_cs`. `run_e2e_tests.sh` unpacks the archive there (with `--skip-old-files`)
+beside the committed per-case files: `plain.txt` on the two unencrypted cases (they
+auto-mount with no form), `container.txt` = `APFS` on the encrypted two, and on all four
+`read_only.txt`, `verify_flower.txt` (flower.jpg byte for byte through the provider) and
+`case_sensitive.txt` (whether case.txt and CASE.txt are two files). `verify_apfs_images.py`
+unpacks into `testdata/apfs/` instead; the two copies are the same archive.
+
+**The images are not byte-reproducible.** Volume UUIDs, timestamps, the encryption keys
+and the random `large_file.bin` change on every run, so compare contents, not image hashes.
+
+**Verify on Linux, with code independent of Apple's and the app's:** run
+`scripts/verify_apfs_images.py`. It unpacks the archive if the cases are not already
+there, then runs
+`apfsck` on the container, then mounts through `apfs-fuse` (decrypting with the
+password) and checks flower.jpg byte for byte, the other files, and case sensitivity.
+
+A quick check is possible on the Mac, but it has a gap. Attach the saved raw image
+read-only (`hdiutil attach -readonly -nomount -imagekey diskimage-class=CRawDiskImage`),
+run `fsck_apfs -n` on the `Apple_APFS` partition, unlock with `diskutil apfs
+unlockVolume … -nomount` and mount with `mount_apfs -o rdonly`. `fsck_apfs` will not
+check an **encrypted** container — *"failed to enable crypto I/O mode … Invalid
+argument"*. This happens on read-only and writable image attaches alike, and on a
+physical USB disk under `sudo` (§16.2). The encrypted images therefore get no
+structural check on macOS, and none on Linux either (below).
+
+First run, 2026-10-02, macOS 26.6.2 (arm64), script unchanged from `9f996ca`:
+
+| Case | `fsck_apfs -n` | flower.jpg | case.txt / CASE.txt | files |
+|---|---|---|---|---|
+| `apfs_ci` | container OK | matches | UPPER / UPPER | 6 |
+| `apfs_cs` | container OK | matches | lower / UPPER | 7 |
+| `apfs_enc_ci` | cannot run (above) | matches, after unlock | UPPER / UPPER | 6 |
+| `apfs_enc_cs` | cannot run (above) | matches, after unlock | lower / UPPER | 7 |
+
+Linux, 2026-10-02, `verify_apfs_images.py` with apfsprogs `3721463` (0.2.1) and
+apfs-fuse built from source: **4 of 4 verified.** `apfsck` passes the two plain
+containers; `apfs-fuse` reads flower.jpg byte for byte, "file with spaces.txt" and the
+right case behaviour on all four, the encrypted two through its own decryption with
+the password.
+
+**No tool here checks an encrypted APFS volume's structure.** `apfsck` takes no
+password and treats encrypted metadata as unsupported, so the verifier skips it for
+the `_enc` cases and says so. Before stopping there, `apfsck` also fails earlier, at
+the container keybag. It predates the layout macOS 26 writes:
+- entries are aligned to 16 bytes, as Apple's reference and apfs-fuse's `KeyMgmt.cpp`
+  both specify;
+- the volume key is a 124-byte DER blob, not a bare 40-byte wrapped key;
+- `kl_nbytes` counts the 16-byte locker header, and no null entry follows.
+
+The keybag was decrypted and decoded by hand to confirm it is well-formed. With
+`apfsck` patched for those three points, it got through the container and stopped at
+the first encrypted volume block, as expected. The patch was not kept: it only shows
+that the keybag is not the problem.
+
+## 7. The VeraCrypt benchmark drive (macOS, scripted)
+
+This one is fully scripted. It is the drive every figure in
+`docs/BENCHMARK_RESULTS.md` was measured on.
+
+```sh
+diskutil list                      # identify the disk FIRST
+scripts/prepare_test_usb.sh --disk diskN --fs exfat --veracrypt --free 4
+```
+
+Flags that matter: `--fs fat32|exfat`, `--veracrypt`, `--vc-encryption AES|Serpent`,
+`--vc-hash SHA-512`, `--vc-pim 1`, `--cluster 4096`, `--free 4`, `--quick` (small
+fixtures, no bulk fill — for iterating on the script itself, never for measuring).
+
+It refuses anything that is not an external, removable USB disk and has a size ceiling
+to catch a typo'd identifier. **It repartitions the disk.** Read the summary it prints
+before confirming, and per `AGENTS.md` never paste it in the same block as a read-only
+command.
+
+Verify and clean are separate scripts: `scripts/verify_test_usb.sh`,
+`scripts/clean_test_usb.sh`.
+
+---
+
+# LUKS drives
+
+Three drives. None of this is scripted yet — these are manual Linux procedures, and
+`scripts/prepare_test_usb.sh` is macOS-only so it cannot be reused.
+
+| Drive | Layout | Tests |
+|---|---|---|
+| **A** | 4 partitions: LUKS1/LUKS2 × FAT32/exFAT | Both header formats, both KDFs, both supported filesystems, **and multi-drive** |
+| **B** | 1 partition: LUKS1 + ext4 | PBKDF2 unlock, then ext4 detection |
+| **C** | 1 partition: LUKS2 + ext4 | Argon2id unlock, then ext4 detection |
+
+**Know what B and C can prove today.** The app does not implement ext4 — it is one of
+the three filesystems (`fat16`, `ntfs`, `ext4`) that exist as cases *to be refused*. So
+until ext4 support lands, B and C test that the app **unlocks the LUKS container and
+then refuses the filesystem cleanly**, naming ext4 rather than reporting a corrupt
+volume. That is a real and useful test: it separates a container-layer failure from a
+filesystem-layer one. The fixtures are still worth writing so the drives are ready if
+ext4 is implemented.
+
+## 8. Prerequisites and safety
+
+```sh
+sudo apt install cryptsetup-bin dosfstools exfatprogs e2fsprogs parted
+cryptsetup --version        # 2.4+ for reliable LUKS2 Argon2id support
+```
+
+Identify the device and **confirm it is the right one** — every command below destroys
+data:
+
+```sh
+lsblk -o NAME,SIZE,TYPE,TRAN,MODEL,MOUNTPOINT
+# Expect TRAN=usb and the size you expect. /dev/sdX below is a placeholder.
+```
+
+Two conventions used throughout, both deliberate:
+
+- `PASS=password123` — the LUKS drives' password, and once every fixture's. The
+  VeraCrypt ones moved to `otgmaster-test-password-2026` (§1), because VeraCrypt 1.26
+  refuses PIM 1 with a password under 20 characters; cryptsetup has no such rule.
+- **`--pbkdf-memory 65536` (64 MB) on every LUKS2 volume.** cryptsetup's desktop
+  default is 1–4 GB of Argon2 memory, which a phone cannot allocate — a drive formatted
+  with defaults tests nothing except the out-of-memory path. This is the single most
+  important parameter on this page; see `docs/LUKS_SUPPORT.md` §2.1.
+
+## 9. Drive A — four partitions, LUKS1/2 × FAT32/exFAT
+
+MBR allows exactly four primary partitions, which is what makes this layout possible.
+It is also **the only way to test multiple encrypted volumes on one physical device**.
+
+| Partition | Container | Filesystem | Label | Path |
+|---|---|---|---|---|
+| `p1` | LUKS1 | FAT32 | `LUKS1FAT` | PBKDF2 |
+| `p2` | LUKS1 | exFAT | `LUKS1EXF` | PBKDF2 |
+| `p3` | LUKS2 | FAT32 | `LUKS2FAT` | Argon2id |
+| `p4` | LUKS2 | exFAT | `LUKS2EXF` | Argon2id |
+
+### 9.1 Partition
+
+```sh
+sudo wipefs -a /dev/sdX
+sudo parted -s /dev/sdX mklabel msdos
+sudo parted -s /dev/sdX mkpart primary 1MiB    16GiB
+sudo parted -s /dev/sdX mkpart primary 16GiB   32GiB
+sudo parted -s /dev/sdX mkpart primary 32GiB   48GiB
+sudo parted -s /dev/sdX mkpart primary 48GiB   100%
+sudo partprobe /dev/sdX
+lsblk /dev/sdX          # expect sdX1..sdX4, ~15.5 GB each
+```
+
+### 9.2 Create the containers
+
+```sh
+PASS=password123
+
+for p in 1 2; do
+    echo -n "$PASS" | sudo cryptsetup luksFormat --type luks1 \
+        --cipher aes-xts-plain64 --key-size 512 --hash sha256 \
+        --pbkdf-force-iterations 10000 --batch-mode /dev/sdX$p -
+done
+
+for p in 3 4; do
+    echo -n "$PASS" | sudo cryptsetup luksFormat --type luks2 \
+        --cipher aes-xts-plain64 --key-size 512 --hash sha256 \
+        --pbkdf argon2id --pbkdf-memory 65536 --pbkdf-parallel 4 \
+        --pbkdf-force-iterations 4 --sector-size 512 \
+        --batch-mode /dev/sdX$p -
+done
+```
+
+**Capture the headers. This is the ground truth for the parser** — payload offset, key
+size, cipher, sector size, KDF parameters, keyslot layout:
+
+```sh
+mkdir -p ~/otg-luks-fixtures
+for p in 1 2 3 4; do
+    sudo cryptsetup luksDump /dev/sdX$p | sudo tee ~/otg-luks-fixtures/luks-A-p$p.txt
+done
+```
+
+Keep that directory. Without it there is nothing to check the app's header parsing
+against except the app itself.
+
+### 9.3 Open and format
+
+```sh
+for p in 1 2 3 4; do
+    echo -n "$PASS" | sudo cryptsetup open /dev/sdX$p otgA$p -
+done
+
+# 4096-byte clusters, deliberately small, to inflate the FAT and the exFAT
+# allocation bitmap — the same reasoning as prepare_test_usb.sh.
+sudo mkfs.vfat -F 32 -s 8 -n LUKS1FAT /dev/mapper/otgA1
+sudo mkfs.exfat -c 4096 -L LUKS1EXF  /dev/mapper/otgA2
+sudo mkfs.vfat -F 32 -s 8 -n LUKS2FAT /dev/mapper/otgA3
+sudo mkfs.exfat -c 4096 -L LUKS2EXF  /dev/mapper/otgA4
+
+for p in 1 2 3 4; do
+    sudo mkdir -p /mnt/otgA$p
+    sudo mount /dev/mapper/otgA$p /mnt/otgA$p
+done
+```
+
+`-s 8` is sectors-per-cluster: 8 × 512 = 4096 bytes. On exFAT, `-c` takes bytes
+directly.
+
+Then populate each with §12, using `SEQ_MB=256` — four partitions cannot each hold a
+2 GiB file.
+
+## 10. Drive B — LUKS1 + ext4
+
+```sh
+PASS=password123
+sudo wipefs -a /dev/sdY
+sudo parted -s /dev/sdY mklabel msdos
+sudo parted -s /dev/sdY mkpart primary 1MiB 100%
+sudo partprobe /dev/sdY
+
+echo -n "$PASS" | sudo cryptsetup luksFormat --type luks1 \
+    --cipher aes-xts-plain64 --key-size 512 --hash sha256 \
+    --pbkdf-force-iterations 10000 --batch-mode /dev/sdY1 -
+
+sudo cryptsetup luksDump /dev/sdY1 | sudo tee ~/otg-luks-fixtures/luks-B.txt
+echo -n "$PASS" | sudo cryptsetup open /dev/sdY1 otgB -
+
+# -m 0: no reserved blocks, so the free-space figure the app reports is comparable
+#       to the FAT32/exFAT drives.
+# lazy_*_init=0: write the inode tables and journal NOW rather than lazily in the
+#       background. Without this, the filesystem keeps changing under the first few
+#       reads and no fixture hash is reproducible.
+sudo mkfs.ext4 -L LUKS1EXT4 -m 0 \
+    -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/otgB
+
+sudo mkdir -p /mnt/otgB && sudo mount /dev/mapper/otgB /mnt/otgB
+```
+
+Populate with §12 using `SEQ_MB=2048` — this drive has the whole 62 GB.
+
+**ext4 needs an ownership fix** that FAT32 and exFAT do not. ext4 stores real POSIX
+permissions, and everything written under `sudo` lands root-owned. Do this before
+unmounting or the fixtures are unreadable to a non-root reader:
+
+```sh
+sudo chown -R "$(id -u):$(id -g)" /mnt/otgB/BENCH
+sudo chmod -R a+rX /mnt/otgB/BENCH
+```
+
+## 11. Drive C — LUKS2 + ext4
+
+Identical to Drive B except the container. **Note `--pbkdf-memory 65536`.**
+
+```sh
+PASS=password123
+sudo wipefs -a /dev/sdZ
+sudo parted -s /dev/sdZ mklabel msdos
+sudo parted -s /dev/sdZ mkpart primary 1MiB 100%
+sudo partprobe /dev/sdZ
+
+echo -n "$PASS" | sudo cryptsetup luksFormat --type luks2 \
+    --cipher aes-xts-plain64 --key-size 512 --hash sha256 \
+    --pbkdf argon2id --pbkdf-memory 65536 --pbkdf-parallel 4 \
+    --pbkdf-force-iterations 4 --sector-size 512 \
+    --batch-mode /dev/sdZ1 -
+
+sudo cryptsetup luksDump /dev/sdZ1 | sudo tee ~/otg-luks-fixtures/luks-C.txt
+echo -n "$PASS" | sudo cryptsetup open /dev/sdZ1 otgC -
+
+sudo mkfs.ext4 -L LUKS2EXT4 -m 0 \
+    -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/otgC
+
+sudo mkdir -p /mnt/otgC && sudo mount /dev/mapper/otgC /mnt/otgC
+```
+
+Populate with §12 (`SEQ_MB=2048`), then apply the same `chown`/`chmod` as §10.
+
+## 11a. Drive D — VeraCrypt + ext4, plain ext4, plain NTFS
+
+The only drive with a **mixed** partition table, and the only one covering VeraCrypt
+over ext4. Drives A–C are LUKS, so before this one the VeraCrypt+ext4 combination had
+never run on hardware.
+
+| Part | Share | Contents | Credentials |
+|---|---|---|---|
+| p1 | 40% | VeraCrypt (AES / SHA-512 / PIM 1) → ext4, label `VCEXT4` | `password123`, PIM 1 |
+| p2 | 30% | plain ext4, label `PLAINEXT4` | none |
+| p3 | 30% | plain NTFS, label `NTFSPLAIN` | none |
+
+**p2 is the control.** It carries a byte-identical fixture tree to p1, built by the same
+function in the script, so the two differ only by the crypto layer. An ext4 failure that
+appears on p1 and not on p2 is in the cipher path, not in the ext4 code — which is the
+distinction that took a destroyed drive to make the first time.
+
+**p3 must be refused.** NTFS is unsupported, so it carries only a marker file. It also
+covers the classification path: a partition whose first sector reads `NTFS` cannot be a
+VeraCrypt volume, and the app must not offer it in the unlock picker. It did, once,
+tagged `VERACRYPT` — see `ContainerClassificationTest`.
+
+Run it with the script rather than by hand; unlike A–C this one cannot detect an
+already-prepared state, because a VeraCrypt volume is indistinguishable from random
+data without the password, so every run starts from zero and prompts before wiping.
+
+```sh
+sudo bash scripts/prepare_drive_d.sh /dev/sdZ
+```
+
+`BIG_MIB`, `SMALL_MIB` and `DENSE_N` shrink the fixtures for a fast iteration, at the
+cost of comparability with drive C — leave them alone for a run whose numbers you
+intend to quote. The VeraCrypt parameters are written to
+`/root/otg-luks-fixtures/veracrypt-D.txt`.
+
+## 12. The dummy files — what goes inside, and why
+
+Every drive gets the same `BENCH/` tree. **Each fixture exists to stress one specific
+path**; a fixture of the wrong shape is how this project produced false passes before
+(see §14).
+
+| Fixture | Content | Stresses |
+|---|---|---|
+| `large/seq_<N>.bin` | Random bytes | Sequential throughput, random 4 KiB reads, the ≥2 GiB boundary |
+| `dense_short/` | 10,000 files, 8.3 names | Directory listing, one directory entry per file |
+| `dense_lfn/` | 10,000 files, long names | Listing with ~4 entries per file |
+| `nested/` | 10 levels deep | Path resolution (every level is re-listed) |
+| `reports/` | empty | Where the on-device harness writes results |
+
+Set `SEQ_MB` per drive: **256** for Drive A's partitions, **2048** for B and C. A
+2 GiB file is what exercises the 32-bit overflow that once made every ≥2 GiB read
+return zero bytes while all ten correctness cases still passed.
+
+```sh
+# M=mountpoint, SEQ_MB=size of the sequential fixture in MiB
+populate() {
+    M="$1"; SEQ_MB="$2"
+    B="$M/BENCH"
+    sudo mkdir -p "$B/large" "$B/dense_short" "$B/dense_lfn" "$B/nested" "$B/reports"
+
+    # --- large: sequential + random-read target -----------------------------
+    # Random data, not zeros: a sparse or compressible file lets the drive's
+    # controller cheat and the throughput figure becomes fiction.
+    sudo dd if=/dev/urandom of="$B/large/seq_${SEQ_MB}m.bin" \
+        bs=1M count="$SEQ_MB" status=progress
+    # A 256 MiB file is also needed by the random-read case on every drive.
+    if [ "$SEQ_MB" -ne 256 ]; then
+        sudo dd if=/dev/urandom of="$B/large/seq_256m.bin" \
+            bs=1M count=256 status=none
+    fi
+
+    # --- dense_short: 10,000 8.3-compatible names --------------------------
+    sudo sh -c "cd '$B/dense_short' && for i in \$(seq -w 1 10000); do
+        printf 'x' > f\$i.dat
+    done"
+
+    # --- dense_lfn: 10,000 long names (~4 dir entries each) ----------------
+    sudo sh -c "cd '$B/dense_lfn' && for i in \$(seq -w 1 10000); do
+        printf 'x' > \"a_file_with_a_deliberately_long_name_for_lfn_testing_\$i.dat\"
+    done"
+
+    # --- nested: 10 levels, one leaf ---------------------------------------
+    D="$B/nested"
+    for l in $(seq -w 1 10); do D="$D/level_$l"; sudo mkdir -p "$D"; done
+    sudo dd if=/dev/urandom of="$D/leaf_at_depth_10.dat" bs=4k count=1 status=none
+
+    sync
+}
+
+# Drive A
+for p in 1 2 3 4; do populate "/mnt/otgA$p" 256; done
+# Drives B and C
+populate /mnt/otgB 2048
+populate /mnt/otgC 2048
+```
+
+The dense loops take several minutes each on a slow stick — 20,000 file creations per
+volume. `printf 'x'` rather than `truncate` keeps every file non-empty, because a
+zero-length file skips the cluster-allocation path entirely.
+
+### 12.1 The manifest — the only external ground truth
+
+**Do not skip this.** `fixtures` has never once compared a host-computed hash on any
+device, because every existing drive carries `-` placeholders and the suite reports
+`nothing to check`. It is the only check that can catch the app and the fixture
+generator being wrong in the same direction.
+
+```sh
+manifest() {
+    M="$1"; LUKSREF="$2"
+    B="$M/BENCH"
+    {
+        echo "# OTG Master benchmark fixture"
+        echo "# generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "# luks:      $LUKSREF"
+        echo
+        echo "# path<TAB>bytes<TAB>sha256"
+        for f in "$B"/large/*.bin; do
+            printf 'large/%s\t%s\t%s\n' "$(basename "$f")" \
+                "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+        done
+        for d in dense_short dense_lfn; do
+            # Entry format must match benchFixtures exactly: a regular file is
+            # "name<TAB>size", a subdirectory is "name<TAB>dir".
+            printf '%s/\t%s files\t%s\n' "$d" \
+                "$(find "$B/$d" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+                "$(cd "$B/$d" && for f in *; do
+                    if [ -d "$f" ]; then printf '%s\tdir\n' "$f"
+                    elif [ -f "$f" ]; then printf '%s\t%s\n' "$f" "$(stat -c%s "$f")"
+                    fi
+                   done | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
+        done
+        L=$(find "$B/nested" -name leaf_at_depth_10.dat)
+        printf 'nested/leaf_at_depth_10.dat\t%s\t%s\n' \
+            "$(stat -c%s "$L")" "$(sha256sum "$L" | cut -d' ' -f1)"
+    } | sudo tee "$B/MANIFEST.txt" > /dev/null
+}
+
+for p in 1 2 3 4; do manifest "/mnt/otgA$p" "luks-A-p$p.txt"; done
+manifest /mnt/otgB luks-B.txt
+manifest /mnt/otgC luks-C.txt
+```
+
+**The directory-line format is a contract with `benchFixtures`** and all four parts of it
+matter. Getting any one wrong produces a mismatch that looks exactly like data
+corruption:
+
+1. **The size field must end in `files`.** The app rejects anything else as an
+   older-format manifest and reports `skipped — manifest predates this check` rather
+   than comparing. That message is what every current drive prints.
+2. **A regular file is `name<TAB>size`; a subdirectory is `name<TAB>dir`.** A
+   subdirectory has no length the device can read — libaums throws
+   `UnsupportedOperationException("This is a directory!")` — so the app substitutes the
+   literal `dir`, and the host must do the same. `dense_short` and `dense_lfn` contain
+   no subdirectories so it makes no difference there, but it will the moment a fixture
+   with nested content is hashed.
+3. **`LC_ALL=C` is not optional.** The app sorts with Kotlin's natural String ordering,
+   which is byte order for ASCII names; a locale-dependent host sort produces a
+   different hash on a different machine.
+4. **Entries are joined with `\n`, no trailing newline** — which is what
+   `sha256sum` over the piped listing produces, since the final `printf` supplies the
+   separator between lines only.
+
+The count in the size field is computed rather than assumed: the app only checks the
+suffix, so a hardcoded `10000 files` would still be accepted while being untrue.
+
+### 12.2 Teardown
+
+Always close the mappers, or the next run finds the device busy:
+
+```sh
+for p in 1 2 3 4; do sudo umount /mnt/otgA$p; sudo cryptsetup close otgA$p; done
+sudo umount /mnt/otgB && sudo cryptsetup close otgB
+sudo umount /mnt/otgC && sudo cryptsetup close otgC
+sync
+```
+
+Confirm nothing is left open before unplugging:
+
+```sh
+sudo dmsetup ls        # should list no otg* entries
+lsblk /dev/sdX         # no crypt children
+```
+
+## 12a. Giving a drive hashable fixtures
+
+The `fixtures` section is the only check that can see silent data corruption in
+the fixture tree, and it does nothing without hashes in `BENCH/MANIFEST.txt`.
+Drives built by `prepare_drive_*.sh` carry them. Drives built by the older
+`prepare_test_usb.sh` — the VeraCrypt FAT32 and exFAT benchmark drives — do not,
+so their runs report `nothing to check — manifest has no hashes`.
+
+Rebuilding a 60 GB drive to get hashes is not a reasonable price. Regenerate the
+manifest in place instead:
+
+```sh
+sudo bash scripts/regen_manifest.sh /dev/sdX1
+```
+
+It takes the **partition**, detects the container itself (LUKS, VeraCrypt, or a
+plain partition), mounts, rewrites `BENCH/MANIFEST.txt`, and unmounts. Nothing is
+reformatted. Password defaults to `password123` and VeraCrypt PIM to 1; pass them
+as the second and third arguments otherwise.
+
+**Regenerate from a drive you believe is good.** The manifest records the drive as
+it is now, so running it over a damaged drive blesses the damage as the new
+baseline and the check goes quiet again. A fresh preparation, or a volume that has
+just passed its filesystem checker, is the right moment. The benchmark's write
+sections use their own scratch files and never touch the fixture tree, so
+regenerating after a run is not unsound in itself — but a manifest generated right
+after an unexplained failure proves nothing.
+
+Two format details cost a debugging session each, and the script exists partly to
+stop them being retyped:
+
+- a directory record's size field **must** end in `files`. The older format wrote
+  `10 levels` there, next to a *file's* hash rather than a listing hash; comparing
+  those produces a mismatch indistinguishable from corruption, which is why the
+  benchmark skips such lines instead of failing them.
+- the directory hash is over the sorted `name<TAB>size` listing with the trailing
+  newline stripped (`head -c -1`), because the benchmark joins entries with `\n`
+  as a separator, not a terminator.
+
+## 13. Resume checklist
+
+For an agent picking this up cold.
+
+**Already done, nothing to redo:**
+
+- The VeraCrypt benchmark drive is scripted and working; four devices have full
+  results in `docs/BENCHMARK_RESULTS.md`.
+- E2E fixtures exist for FAT32, exFAT, keyfile and PIM variants, Serpent, an
+  unsupported-cipher rejection, a partitioned MBR, and FAT16/NTFS/ext4 rejections.
+- `docs/LUKS_SUPPORT.md` holds the design evaluation and the seven gaps.
+
+**Not done:**
+
+| Task | Blocker |
+|---|---|
+| Build drives A, B, C | Needs a Linux host and 3 USB sticks (~64 GB each) |
+| LUKS implementation | Design agreed in `LUKS_SUPPORT.md`; no code |
+| ext4 support | Unimplemented; B and C are rejection cases until then |
+| A real `fixtures` comparison | Needs any drive built with §12.1 above |
+| Serpent measurement | Supported and E2E-tested, never benchmarked |
+| Multi-drive (`saf par cross`) | Needs two volumes on one device — Drive A provides this |
+
+**Order to work in:** build Drive A first. It is the only drive that unblocks two
+separate gaps at once (LUKS verification *and* multi-drive), and its four partitions
+exercise both header formats against filesystems the app already supports — so a
+failure is unambiguously in the LUKS layer rather than in a new filesystem driver. B and
+C are worth less until ext4 exists.
+
+**When a drive is built, record it**: add the `luksDump` output location and the drive's
+label to this section, so the next reader knows the fixture exists without plugging it
+in.
+
+## 14. Verifying the fixture is real
+
+A generated fixture is a claim about the disk, and the claims fail in both directions.
+
+**Host-computed hashes are the only external ground truth.**
+`prepare_test_usb.sh` writes `BENCH/MANIFEST.txt` with `path<TAB>bytes<TAB>sha256`,
+hashed on the host with `shasum -a 256`. The benchmark's `fixtures` case compares
+against it. Right now **it has never once run a real comparison**: every drive in use
+was prepared by an older script and the suite reports `manifest has no hashes (old
+prepare script?)`. Any drive you prepare for a new format should be prepared with the
+current script so this check actually executes — it is the only thing in the suite that
+can catch the app and the fixture generator being wrong in the same direction.
+
+**Cross-device agreement.** Correctness case B prints a SHA-256 that has been
+`ac3e360a187bfe9f…` on every device and both filesystems. A new filesystem fixture that
+produces a *different* constant is not necessarily broken, but it must at least be
+constant across devices — that is what separates "the results agree" from "each device
+agrees with itself".
+
+**Distrust a pass that should not be possible.** Every false pass in this project came
+from the fixture's shape rather than the test's logic: aligned-only writes hid two
+corruption bugs, 4–8 KiB fixtures hid a 2 GiB read overflow, single-threaded tests hid
+a lock shipped wrong. When adding a fixture for a new format, confirm it **fails**
+against the unimplemented state before you make it pass.
+
+## 15. Practical traps
+
+Collected from actually running these, in rough order of time lost.
+
+- **`generate_testdata.sh` needs `sudo`** (it calls `veracrypt`, `mkfs`, loop devices),
+  which leaves `testdata/` root-owned. The script ends with `chmod -R a+rX testdata/`
+  for exactly this reason — keep that if you add steps after it.
+- **`veracrypt -t -d` races the kernel** releasing the device mapper node. Both
+  scripts fall back to `dmsetup`; copy that rather than retrying the veracrypt call.
+- **`veracrypt -l` parsing is positional** — field 3 is the mapper device. It also
+  produces no stdout under `--non-interactive`, which kills the script under `set -e`
+  if you pipe it naively.
+- **DiskArbitration re-mounts behind you** on macOS. `prepare_test_usb.sh` retries
+  unmounting in a loop rather than unmounting once, because VeraCrypt fails with
+  `Resource busy: /dev/diskNsM` otherwise.
+- **Quick-format leaves stale patterns** in unused areas. That is fine for a fixture,
+  but it means a read of unallocated space can return plausible-looking old data —
+  which is precisely what the slack-leak correctness cases look for, so do not rely on
+  "it returned zeros" as evidence of anything.
+- **`newfs_exfat` can skip a reformat and still exit 0.** It detects an existing exFAT
+  signature and declines, successfully. `prepare_test_usb.sh` wipes the signature first
+  and then *confirms* the cluster size afterwards rather than assuming the format
+  happened — without that, you get a drive that looks freshly prepared and is not.
+- **Spotlight will index 50+ GiB** of fresh fixtures in the background and skew every
+  measurement taken in the next hour. The script disables it on the volume.
+- **The two generators use different passwords by convention.** `password123` in both,
+  and `prepare_test_usb.sh` notes the match is deliberate so the E2E suite agrees;
+  changing one silently breaks the other.
+- **`prepare_test_usb.sh` is destructive** — it repartitions a disk. Per `AGENTS.md`,
+  it is never presented in the same block as a read-only command, and it refuses
+  anything that is not an external removable USB disk, with a size ceiling to catch a
+  typo'd identifier. Read the summary it prints before confirming.
+
+## 16. The device-matrix drives (four 64 GB drives, ten partitions each)
+
+Every container × filesystem combination the app supports, on real USB hardware:
+37 combinations plus three BitLocker cipher variants, ten 5600 MiB partitions per
+drive. The layout lives in one place, `scripts/matrix_layout.py`:
+
+| Drive | Partitions |
+|---|---|
+| 1 | APFS ×4 (plain/encrypted × case-insensitive/sensitive) · plain FAT32, exFAT, NTFS, ext4 · BitLocker+NTFS (XTS-128), BitLocker+exFAT (XTS-256) |
+| 2 | VeraCrypt+FAT32/exFAT/NTFS/ext4 · LUKS1+FAT32/ext4 · LUKS2+exFAT · LUKS2 4K+ext4/NTFS · BitLocker+FAT32 (CBC-128) |
+| 3 | LUKS1+exFAT/NTFS · LUKS2+FAT32/NTFS/ext4 · LUKS2 4K+FAT32/exFAT · plain ext2, ext3 · BitLocker+NTFS (CBC-256) |
+| 4 | ext2/ext3 in LUKS1, LUKS2, LUKS2 4K and VeraCrypt · BitLocker+FAT32 (XTS-256), BitLocker+exFAT (CBC-128) |
+
+Every partition holds the same kind of read set, `BENCH/`
+(`scripts/make_fixture_tree.py`): a 2100 MiB file (reads cross the 2³¹-byte offset),
+a 256 MiB file, 10,000 short and 10,000 long names, a ten-deep path, ~900 mixed-size
+files in a tree, and edge cases (empty, cluster-boundary sizes, a 64 MiB zero file,
+spaces, Unicode, an emoji, a 200-character name). 3.0 GB on writable partitions,
+leaving ~2.4 GB for writes; 3.5 GB on read-only ones (APFS, ext2, ext3).
+`BENCH/MANIFEST.txt` hashes **every** file, and `fixtures` checks every one.
+
+Passwords: `password123` everywhere, VeraCrypt PIM 1, BitLocker recovery key
+`111111-222222-333333-444444-555555-666666-111111-222222`.
+
+### 16.1 How the pipeline is split
+
+Only two steps need root, and only those touch the drive:
+
+1. **Build** (Linux, no root): `build_matrix_drive.py` makes each partition as an
+   image file — filesystem, read set, container — with the same tools as the E2E
+   matrix. It also keeps the plaintext and a per-MiB hash of it: the baseline.
+2. **Verify the build** (no root): `verify_matrix_drive.py --build`.
+3. **Write** (`sudo`, DESTRUCTIVE): `write_matrix_drive.sh` partitions the drive and
+   `dd`s the images in.
+4. **Read back** (`sudo`, read-only): `read_matrix_drive.sh` copies every partition
+   to an image file.
+5. **Verify the drive** (no root): `verify_matrix_drive.py --images`. Per partition:
+   independent decryption, every MiB against the baseline (a read-only partition
+   must not change at all), the filesystem's own checker, then a read-only kernel
+   mount checking every manifest file byte for byte and flagging any file outside
+   `BENCH/reports/` and the runner's `BENCH_*` directories. One table, one verdict.
+
+After every phone run: steps 4 and 5 again. `--accept` makes a CLEAN state the new
+baseline (runs leave files behind, and even deleted files leave changed blocks).
+
+**Turn desktop auto-mount off before plugging a matrix drive into the laptop.** A
+read-write auto-mount changes the partition (ext4 records the mount in its
+superblock), and on ext2/ext3 that is a verification failure. The two root scripts
+refuse to start if anything is mounted and make udisks ignore the disk while they run.
+
+```sh
+gsettings set org.gnome.desktop.media-handling automount false
+```
+
+The work directory is `matrix/` in the workspace (gitignored). A full drive needs
+about 90 GB there: ~60 GB of images, ~30 GB of sparse plaintext, plus the read-back.
+APFS checks need apfs-fuse and apfsck: `bash scripts/build_apfs_tools.sh` builds both
+without root (apfs-fuse needs `libfuse3-dev`) and prints the two `export` lines.
+
+### 16.2 Drive 1 — the Mac first
+
+APFS can only be made on a Mac, and the Mac must go first: macOS writes its own files
+onto any volume it can mount, so it must never see the drive after the Linux
+partitions exist. On the Mac, from the repo root:
+
+```sh
+diskutil list                              # identify the USB disk, e.g. disk4
+```
+
+Then, on its own — this ERASES the disk, after asking for the identifier to be typed:
+
+```sh
+bash scripts/prepare_matrix_drive_macos.sh --disk disk4
+```
+
+It makes the GPT (macOS adds a 200 MiB EFI partition first), the four APFS partitions
+in this order — D1APFSCI, D1APFSCS, D1APFSECI, D1APFSECS — and leaves the rest free;
+fills each with the read set (3.5 GB, plus case.txt/CASE.txt on the case-sensitive
+two); checks each volume's case behaviour; and ejects. About 45 minutes on a USB 3 stick. Then move the
+drive to Linux and do not plug it into a Mac again.
+
+Each volume also carries macOS's own `.fseventsd/` and `.Spotlight-V100/` at its root.
+Spotlight creates its folder the moment the volume mounts, before the script can drop
+`.metadata_never_index`. They are written on the Mac, before the Linux baseline is
+taken, so the first read-back accepts them like any other content. They are not files
+a phone run created.
+
+`sudo fsck_apfs -n /dev/diskNsK` on each finished partition checks the two plain
+volumes. It cannot check the encrypted two: it fails with *"failed to enable crypto I/O
+mode … Invalid argument"*, as it does on disk images (§6b). On 2026-10-03 it reported
+D1APFSCI and D1APFSCS OK, and refused D1APFSECI and D1APFSECS. So Linux `apfsck`,
+during the read-back, is the only structural check of the encrypted pair.
+
+### 16.3 Building and writing (Linux)
+
+Build (no root; 15–30 minutes per drive with `-j 4`), then verify the build:
+
+```sh
+python3 scripts/build_matrix_drive.py --drive 1 --out matrix/d1
+python3 scripts/verify_matrix_drive.py --build matrix/d1
+```
+
+Drive 1's build covers its six Linux partitions; the APFS rows show NOT CHECKED until
+the drive is read back. `--test-scale` builds 300 MiB partitions instead, for testing
+the pipeline itself.
+
+Plug the drive in (auto-mount off), find it, and write — on its own, DESTRUCTIVE:
+
+```sh
+lsblk -o NAME,SIZE,TRAN,MODEL,SERIAL        # identify it, e.g. /dev/sdb
+```
+
+```sh
+sudo bash scripts/write_matrix_drive.sh /dev/sdb matrix/d1
+```
+
+Drives 2–4 are repartitioned from scratch. Drive 1 must already carry the Mac's EFI
+and four APFS partitions; the script refuses otherwise, and adds its six after them.
+
+### 16.4 Read back and take the baselines
+
+Before the drive goes near a phone:
+
+```sh
+sudo bash scripts/read_matrix_drive.sh /dev/sdb matrix/d1-read matrix/d1
+python3 scripts/verify_matrix_drive.py --build matrix/d1 --images matrix/d1-read --accept
+```
+
+Every partition must come back CLEAN with 0 MiB changed. This is the first look at
+Drive 1's APFS partitions from Linux: `--accept` takes their baselines and keeps their
+manifests. After each phone run, the same two commands, without `--accept` unless the
+result is CLEAN and the changes are the run's own.
+
+### 16.5 What the pipeline was tested against
+
+At `--test-scale`, all four drives' Linux partitions (36) built and verified CLEAN.
+Injected damage, each on a copy of a built partition:
+
+| Damage | Caught by |
+|---|---|
+| One ciphertext byte flipped inside a file (LUKS1+ext4) | content check; `e2fsck` passed it |
+| 4 KiB of FAT32's first FAT overwritten | `fsck.vfat`, and an I/O error reading a file |
+| One bit flipped in a file on read-only ext2 | "1 MiB changed on a partition the app must never write" |
+| A stray file at the root, beside a run's own output | "unexplained file", while the run's files were counted, not flagged |
+
+The Mac script first ran on a real drive on 2026-10-03: macOS 26.6.2 (arm64), a 62.0 GB
+"USB 3.2.1 FD" stick. It was rehearsed beforehand on a 59 GB sparse image, with the
+virtual-disk refusal removed and a small fixture size. All four volumes filled and passed
+their case checks. Fill times: 8.4, 7.1, 11.2 and 15.9 minutes (CI, CS, ECI, ECS), so
+about 45 minutes in total. The two encrypted volumes were slower, and the stick slowed as
+it filled. The run then stopped before ejecting: Spotlight's `mds` refused the unmount
+of the last volume. A retry ten minutes later succeeded, and the script now retries for
+two minutes.
+
+**Which stick is which.** All four are the same PNY "USB 3.2.1 FD" model, so the USB
+serial is the only electronic tell. Label each one physically as well.
+
+| Drive | USB serial | Contents |
+|---|---|---|
+| 1 | `071C5C4E138E6B31` | Mac EFI + APFS ×4, plain FAT32/exFAT/NTFS/ext4, BitLocker NTFS/exFAT |
+| 2 | `071C5C306F8A2D62` | VeraCrypt ×4, LUKS1 FAT32/ext4, LUKS2 exFAT, LUKS2-4K ext4/NTFS, BitLocker FAT32 |
+| 3 | `071C48F5FB0EF456` | LUKS1 exFAT/NTFS, LUKS2 FAT32/NTFS/ext4, LUKS2-4K FAT32/exFAT, plain ext2/ext3, BitLocker NTFS |
+| 4 | `071C48F5FB0EF450` | ext2/ext3 inside LUKS1, LUKS2, LUKS2-4K and VeraCrypt; BitLocker FAT32/exFAT |
+
+Pass the device by serial rather than by `/dev/sdX`, which changes between plug-ins:
+
+```sh
+D3=$(lsblk -dnpo NAME,SERIAL | awk '$2=="071C48F5FB0EF456"{print $1}')
+```
+
+Drives 3 and 4 were built, written and read back on 2026-10-05/06. The two builds
+ran in parallel, about 50 minutes each; the FAT32 partitions' dense folders take the
+longest. Every partition is **CLEAN** at 0 MiB changed against its build (20,910–21,971
+files each). Disk space is the constraint here: two builds plus two read-backs come to
+about 280 GB. Each build's `*.plain.img` files hold 29 GB and nothing downstream reads
+them (writing uses the encrypted image, verifying uses `.chunks`), so they can be
+truncated once a partition is built.
+
+Drives 1 and 2 were written and read back on 2026-10-03: two 62.0 GB PNY "USB 3.2.1
+FD" sticks, written in parallel. `verify_matrix_drive.py --accept` on the read-backs:
+**all 20 partitions CLEAN**. Every Linux-built partition came back with 0 MiB changed
+against its build; every manifest file matched (20,854–21,071 per writable partition);
+every checker was clean. Drive 1's APFS volumes were checked from Linux for the first
+time: `apfsck` clean on the two plain containers, and every file of all four read
+through apfs-fuse, decrypting the encrypted pair with the password (21,777–22,129 files
+each). Their baselines were taken from this read-back, and their manifests copied off
+the drive.
+
+Two problems surfaced on the way, both in the scripts, and were fixed before the run
+that counted. First, the host's `/usr/bin/dd` is uutils coreutils, whose
+`iflag=direct` fails ("IO error: Invalid input"); the scripts now prefer GNU dd
+(`gnudd`). Second, both drives running at once shared one udev rule file; it is now
+one per disk.
+
+
+### 16.6 Drive 5 — VeraCrypt cascades and Argon2, Format and Encrypt (0.4.2)
+
+Stick `071C48F5FB0EF449` (once LUKS Drive A). Unlike Drives 1–4 it is not a build image
+written with `write_matrix_drive.sh`: desktop VeraCrypt makes its volumes in place, so
+the volumes are VeraCrypt's own — the point of a cipher test. Password for every volume
+`otgmaster-test-password-2026` (VeraCrypt 1.26 refuses PIM 1 under 20 characters).
+
+| Part | GPT name | Size | Contents |
+|---|---|---|---|
+| 1 | `VC_ATS_ARGON_PIM0` | 8 GiB | VeraCrypt AES-Twofish-Serpent / Argon2 / default PIM, FAT |
+| 2 | `VC_STA_ARGON_PIM1` | 8 GiB | Serpent-Twofish-AES / Argon2 / 1, exFAT |
+| 3 | `VC_TWO_SHA512_PIM0` | 8 GiB | Twofish / SHA-512 / default, NTFS |
+| 4 | `VC_AT_ARGON_PIM1` | 8 GiB | AES-Twofish / Argon2 / 1, exFAT |
+| 5 | `VC_SA_SHA512_PIM1` | 8 GiB | Serpent-AES / SHA-512 / 1, FAT |
+| 6 | `VC_TS_ARGON_PIM31` | 8 GiB | Twofish-Serpent / Argon2 / 31 (1 GiB, 13 passes), exFAT |
+| 7 | `FMT_EXFAT` | 2 GiB | plain exFAT — for Format |
+| 8 | `FMT_FAT32` | 2 GiB | plain FAT32 — for Format |
+| 9 | `ENC_TO_EXFAT` | 2 GiB | plain FAT32 — for Encrypt (to exFAT) |
+| 10 | `ENC_TO_FAT32` | 2 GiB | plain exFAT — for Encrypt (to FAT32) |
+
+The partition table (GPT, ten Microsoft basic data partitions, the sizes above) is made
+with `sfdisk`; the last four were appended later with `sfdisk --append`. Each VeraCrypt
+volume, then its fixture tree (seed = GPT name, manifest kept on the laptop):
+
+```sh
+sudo veracrypt --text --non-interactive --create /dev/sdX1 --volume-type=normal \
+    --encryption=AES-Twofish-Serpent --hash=Argon2 --filesystem=fat --pim=0 \
+    --password=otgmaster-test-password-2026 --quick --random-source=/dev/urandom
+sudo veracrypt --text --non-interactive --mount /dev/sdX1 /tmp/vcx1 \
+    --password=otgmaster-test-password-2026 --pim=0 --hash=Argon2 --protect-hidden=no \
+    --keyfiles= --fs-options="uid=$(id -u),gid=$(id -g),utf8"
+python3 scripts/make_fixture_tree.py /tmp/vcx1 --seed VC_ATS_ARGON_PIM0 \
+    --size 5e8 --manifest-out matrix/vcx/VC_ATS_ARGON_PIM0.MANIFEST.txt
+sudo veracrypt --text --non-interactive --dismount /dev/sdX1
+```
+
+The plain partitions: `mkfs.exfat -L <name>` or `mkfs.vfat -F 32 -n <name>`, mounted
+with the same options, filled with `make_fixture_tree.py … --size 3e8 --large-mib 64
+--dense 2000` (the default 2,100 MiB `large/` file does not fit in 2 GiB).
+
+Two traps met building it:
+
+- **FAT and non-BMP names.** Mounted with `iocharset=utf8`, Linux's vfat refuses the
+  fixture tree's emoji file name (EINVAL) and the fill stops. The `utf8` mount option
+  stores it as a UTF-16 surrogate pair, as Windows does. exFAT takes `iocharset=utf8`.
+- **The plain partitions need their filesystem made before the fill**, and a failed
+  `mkfs` leaves the partition with none — the app then has no card for it, so neither
+  Format nor Encrypt can reach it. Partition 10 ended up that way and sat out the
+  first run.
+
+After a phone run, `verify_volume.sh /dev/sdXN otgmaster-test-password-2026 <pim>` (PIM 0
+for VeraCrypt's default) opens each volume in desktop VeraCrypt and runs its checker —
+which, for partitions the app has encrypted, is also the check that VeraCrypt reads what
+the app wrote.

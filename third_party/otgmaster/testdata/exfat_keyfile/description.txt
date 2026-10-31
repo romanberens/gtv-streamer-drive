@@ -1,0 +1,1 @@
+AES-encrypted VeraCrypt volume (10 MB) formatted as exFAT — the primary supported filesystem. Requires a keyfile (test.key); tests the SAF keyfile-picker UI flow.

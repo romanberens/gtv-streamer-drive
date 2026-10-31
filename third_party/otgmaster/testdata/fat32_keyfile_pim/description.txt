@@ -1,0 +1,1 @@
+AES-encrypted VeraCrypt volume (10 MB) formatted as FAT32, PIM=123. Requires a keyfile (test.key) in addition to the password. Custom PIM tests that the key-derivation iteration count is honoured.

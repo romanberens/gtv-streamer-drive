@@ -1,0 +1,3698 @@
+package app.fayaz.otgmaster
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import android.net.Uri
+import android.os.Build
+import android.provider.DocumentsContract
+import android.os.Bundle
+import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.lerp
+import kotlinx.coroutines.delay
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+
+import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.material3.IconButton
+import android.content.ClipboardManager
+import android.content.ClipData
+import android.content.SharedPreferences
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import app.fayaz.otgmaster.usb.UsbHostDiagnosis
+import app.fayaz.otgmaster.usb.RealUsbDeviceProvider
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import app.fayaz.otgmaster.block.RawBlockDevice
+import app.fayaz.otgmaster.fs.DetectedFilesystem
+import app.fayaz.otgmaster.fs.FilesystemDetector
+import app.fayaz.otgmaster.usb.LibaumsRawBlockDeviceOpener
+import app.fayaz.otgmaster.usb.UsbDeviceDescriber
+import app.fayaz.otgmaster.veracrypt.VeraCryptUnlocker
+import app.fayaz.otgmaster.veracrypt.VolumeCandidate
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import me.jahnen.libaums.core.fs.fat32.Fat32FileSystemCreator
+import me.jahnen.libaums.core.fs.FileSystemFactory
+import me.jahnen.libaums.core.partition.PartitionTableEntry
+import app.fayaz.otgmaster.exfat.ExFatFileSystemCreator
+
+/**
+ * One attached, not-yet-mounted USB mass-storage device that's been opened and probed for
+ * VeraCrypt volume candidates, with a human-readable [displayName] so the user can tell
+ * devices apart in a dropdown when more than one is plugged in.
+ *
+ * [plainPartitions] is non-empty when a recognised plain filesystem (FAT32, exFAT) was
+ * detected directly on one of the device's candidates — the device will be auto-mounted
+ * without any VeraCrypt credentials and will not appear in the unlock form.
+ */
+data class UsbDeviceCandidate(
+    val deviceName: String,
+    val displayName: String,
+    val blockDevice: RawBlockDevice,
+    val candidates: List<VolumeCandidate>,
+    val plainPartitions: List<PlainPartition> = emptyList(),
+    // Partitions found on the drive but not offered in the unlock picker, so the
+    // form can say the list is filtered instead of looking like the whole drive.
+    val hiddenPartitions: Int = 0
+)
+
+data class PlainPartition(
+    val label: String,
+    val startBlock: Long,
+    val blockCount: Long,
+    val filesystemName: String
+)
+
+class MainActivity : AppCompatActivity() {
+    // Provider for USB device handling (real implementation)
+    private lateinit var usbDeviceProvider: app.fayaz.otgmaster.usb.UsbDeviceProvider
+    // Keyed by UsbDevice.deviceName. Kept open (not closed) while listed here, since the
+    // user may switch the dropdown selection before deciding which one to unlock.
+    private val openedDevices = mutableMapOf<String, RawBlockDevice>()
+
+    /**
+     * Serialises volume unlocks across partitions.
+     *
+     * Every partition of a drive shares one USB mass-storage device with a
+     * single command pipe.  Auto-mount fires attemptUnlock() per candidate and
+     * each one launches on Dispatchers.IO, so a four-partition drive had four
+     * unlocks reading the same device at once: on a Pixel 10 Pro XL the
+     * transport collapsed with "Could not read from device, result == -1" and
+     * "MAX_RECOVERY_ATTEMPTS Exceeded", two partitions never mounted, and the
+     * retry storm ran long enough to starve the next unmount.  Reads are
+     * already serialised inside LibaumsRawBlockDevice; this keeps whole unlock
+     * sequences from interleaving, which is what the device could not take.
+     */
+    private val deviceMutex = kotlinx.coroutines.sync.Mutex()
+
+    /** Drive id whose journal-repair dialog is up, or null. */
+    private val journalRepairPrompt = mutableStateOf<String?>(null)
+    /** Bumped after each repair, so cards re-read a volume's read-only state. */
+    private val journalRepairs = mutableIntStateOf(0)
+
+    /**
+     * In-flight unmounts per USB device, so the shared connection is closed by
+     * the last one rather than the first.
+     *
+     * unmountDrive() calls OtgMasterState.removeDrive() synchronously and does
+     * the device work in a coroutine, so unmounting every partition at once
+     * empties mountedDrives before any coroutine runs.  The first to reach the
+     * "am I the last partition?" test then saw an empty list, closed the USB
+     * connection, and the partitions still flushing metadata behind it failed
+     * with "MAX_RECOVERY_ATTEMPTS Exceeded" — which is what stopped a
+     * four-partition drive from ever surviving a remount.
+     */
+    private val pendingUnmounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val _deviceCandidates = mutableStateOf<List<UsbDeviceCandidate>>(emptyList())
+    // Guards against overlapping probes (e.g. from rapid repeated ATTACHED broadcasts on a
+    // flaky connection) racing to open/add the same device twice. Touched only on the UI
+    // thread, so no synchronization is needed.
+    private var isProbingDevices = false
+
+    // For Compose state hoisting
+    private val mountedDrivesState = mutableStateOf<List<MountedDrive>>(emptyList())
+    private val logsState = mutableStateListOf<String>()
+    private val toastState = mutableStateOf<Pair<String, Boolean>?>(null) // message to isSuccess
+    private val newlyMountedDriveIds = mutableStateOf<Set<String>>(emptySet())
+    /** A Scan tap found no USB drive, so the "no drives" message offers its help link. */
+    private val scanFoundNoDrive = mutableStateOf(false)
+    private val pendingToastMountNames = mutableListOf<String>()
+    private val toastMountHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val toastMountRunnable = Runnable {
+        val names = pendingToastMountNames.toList()
+        pendingToastMountNames.clear()
+        toastState.value = if (names.size == 1) Pair("Mounted: ${names[0]}", true)
+                           else Pair("Mounted ${names.size} drives", true)
+    }
+
+    companion object {
+        const val TAG = "OTGMaster"
+        private const val REQUEST_USB_PERMISSION = "app.fayaz.otgmaster.USB_PERMISSION"
+        private const val QEMU_DEVICE_KEY = "qemu:/dev/block/sda"
+        const val EXTRA_DRIVE_ID = "app.fayaz.otgmaster.EXTRA_DRIVE_ID"
+        private const val SHARE_TARGET_CATEGORY = "app.fayaz.otgmaster.category.SHARE_TARGET"
+        private const val PREF_ASKED_NOTIFICATIONS = "asked_notification_permission"
+        private const val PREF_MANUALLY_UNMOUNTED = "manually_unmounted_devices"
+        private const val PREF_LAST_BOOT_TIME = "last_boot_time_ms"
+        private const val PREF_READ_ONLY_DEFAULT = "read_only_default"
+        private const val PREF_READ_ONLY_CHOICES = "read_only_partitions"
+    }
+
+    private lateinit var sharedPreferences: SharedPreferences
+    private val _themeMode = mutableStateOf(ThemeMode.SYSTEM)
+
+    private lateinit var credentialStore: app.fayaz.otgmaster.security.CredentialStore
+    private val autoMountEnabled = mutableStateOf(false)
+    private val mountFormResetKey = mutableStateOf(0)
+    private val autoMountAttempted = mutableSetOf<String>()
+    // Devices the user has explicitly unmounted while still connected. Auto-mount is
+    // suppressed for these until the device is physically detached and re-attached.
+    private val manuallyUnmountedDevices = mutableSetOf<String>()
+    private var isAutoMountPromptShowing = false
+
+    /**
+     * Candidates withheld from the unlock form while an auto-mount prompt is pending.
+     *
+     * The deferral only exists to stop the form flashing behind the biometric prompt,
+     * but it made the form's appearance depend on that prompt always resolving. When
+     * it did not — a stuck [isAutoMountPromptShowing], or the prompt dismissed by the
+     * screen locking without a callback — the candidates were dropped and the form
+     * never appeared. Scanning again did not help, because the device was already in
+     * [openedDevices] and so got filtered out of the next probe, leaving no way back
+     * short of restarting the app. Holding them here means every exit path, plus
+     * onResume, can put them back.
+     */
+    private val deferredCandidates = LinkedHashMap<String, UsbDeviceCandidate>()
+    private val sessionPlaintextCreds = androidx.compose.runtime.snapshots.SnapshotStateMap<String, app.fayaz.otgmaster.security.CredentialStore.Credentials>()
+    private val excludedDeviceKeys = mutableStateOf<Set<String>>(emptySet())
+    /** Settings → Read-only mode: the default for any partition with no choice of its own. */
+    private val readOnlyDefault = mutableStateOf(false)
+    /** Per-partition read-only choices made in the unlock form, keyed by [partitionKey]. */
+    private val readOnlyChoices = mutableStateOf<Map<String, Boolean>>(emptyMap())
+
+    // Debounce buffer: collects hub devices that arrive in rapid succession so they
+    // all go into a single biometric prompt rather than triggering separate ones.
+    private val pendingAutoMountDevices = mutableListOf<UsbDeviceCandidate>()
+    private val autoMountDebounceHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val autoMountDebounceRunnable = Runnable {
+        val batch = pendingAutoMountDevices.toList()
+        pendingAutoMountDevices.clear()
+        if (batch.isNotEmpty()) showAutoMountPrompt(batch)
+    }
+
+    // Guard against concurrent probeQemuDisk calls: the underlying block device can
+    // still be flushing after an ExFAT unmount, making a second concurrent probe slow
+    // and producing a different FileBlockDevice instance that causes a stale
+    // accessibility node in the Compose form (UiAutomator StaleObjectException).
+    private var isQemuProbing = false
+
+    private val versionName: String by lazy {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    }
+    private val versionCode: Long by lazy {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+    }
+
+    // Pending URIs from incoming share intents, held until the picker result returns.
+    private var pendingShareUris: List<Uri> = emptyList()
+
+    // Single launcher for all share-to-drive flows (single or multiple files).
+    private val openDocumentTreeLauncher = registerForActivityResult(
+        object : androidx.activity.result.contract.ActivityResultContract<Uri?, Uri?>() {
+            override fun createIntent(context: Context, input: Uri?): Intent =
+                Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    // content://authority/root/rootId passes DocumentsUI's isRootUri() check
+                    // and opens the picker directly at that root. /tree/ and /document/ URIs
+                    // fail this check and fall back to Downloads.
+                    input?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
+                }
+            override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+                if (resultCode == android.app.Activity.RESULT_OK) intent?.data else null
+        }
+    ) { treeUri ->
+        treeUri ?: return@registerForActivityResult
+        val sources = pendingShareUris.toList()
+        pendingShareUris = emptyList()
+        copyFilesToTree(sources, treeUri)
+    }
+
+    /**
+     * Android 13+ shows an app's notifications only after it has asked. Asked once, when the
+     * first drive mounts, so MountedDriveService's notification can appear in the shade;
+     * declining changes nothing else (the service runs either way).
+     */
+    private val notificationPermission = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted -> android.util.Log.i("OTGMaster", "notification permission granted=$granted") }
+
+    private fun askForNotificationsOnce() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        val prefs = getSharedPreferences("otgmaster_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PREF_ASKED_NOTIFICATIONS, false)) return
+        prefs.edit().putBoolean(PREF_ASKED_NOTIFICATIONS, true).apply()
+        notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    private val permissionIntent: PendingIntent by lazy {
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        val intent = Intent(REQUEST_USB_PERMISSION).apply { setPackage(packageName) }
+        PendingIntent.getBroadcast(this, 0, intent, flags)
+    }
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                REQUEST_USB_PERMISSION -> {
+                    val device = intent.getParcelableExtraCompat<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (device != null && granted) {
+                        appendLog(getString(R.string.log_usb_permission_granted, device.deviceName))
+                        // A phone or camera goes to the MTP path, not the USB-drive one.
+                        if (app.fayaz.otgmaster.mtp.MtpSession.isMtpDevice(device) && !UsbDeviceDescriber.isMassStorageDevice(device)) {
+                            mountMtpDevices(listOf(device), OtgMasterState.mountedDrives.mapNotNull { it.sourceDeviceName }.toSet())
+                        } else openAndProbeUsb()
+                    } else {
+                        appendLog(getString(R.string.log_usb_permission_denied))
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    scanFoundNoDrive.value = false
+                    appendLog(getString(R.string.log_usb_device_attached))
+                    refreshDevices()
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val detached = intent.getParcelableExtraCompat<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    if (detached != null) {
+                        // At detach time, device.serialNumber often throws (device is gone), so
+                        // stableKey falls back to the bus path. Keys stored at mount time likely
+                        // used the serial. Match by vendorId:productId, minus the devices of the
+                        // same model that are still attached — see matchesDetached.
+                        val detachedKeys = setOf(
+                            UsbDeviceDescriber.stableKey(detached, true),
+                            UsbDeviceDescriber.stableKey(detached, false),
+                        )
+                        val vendorProduct = "${detached.vendorId}:${detached.productId}"
+                        val stillAttachedKeys = usbDeviceProvider.getDevices()
+                            .filter { it.deviceName != detached.deviceName }
+                            .flatMap { listOf(
+                                UsbDeviceDescriber.stableKey(it, usbDeviceProvider.hasPermission(it)),
+                                UsbDeviceDescriber.stableKey(it, false),
+                            ) }
+                            .toSet()
+                        handleDetach { key ->
+                            UsbDeviceDescriber.matchesDetached(key, detachedKeys, vendorProduct, stillAttachedKeys)
+                        }
+                    }
+                    appendLog(getString(R.string.log_usb_device_detached))
+                    refreshDevices()
+                }
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Before the first frame, so it is laid out edge-to-edge from the start; the icon
+        // colours follow the in-app theme once it is read (applySystemBarAppearance).
+        enableEdgeToEdge()
+        
+        // Hourly: start due backups whose drives are mounted, remind about overdue ones.
+        runCatching { app.fayaz.otgmaster.backup.BackupScheduler.ensurePeriodic(this) }
+            .onFailure { OtgMasterState.logFailure("backup-scheduler", "Could not schedule the hourly backup check", it) }
+        FileSystemFactory.registerFileSystem(ExFatFileSystemCreator(), 1)
+        FileSystemFactory.registerFileSystem(app.fayaz.otgmaster.ext4.Ext4FileSystemCreator(), 2)
+        FileSystemFactory.registerFileSystem(app.fayaz.otgmaster.ntfs.NtfsFileSystemCreator(), 2)
+        FileSystemFactory.registerFileSystem(app.fayaz.otgmaster.apfs.ApfsFileSystemCreator(), 2)
+
+        // Read grants a previous process extended and could not revoke (it crashed or was killed).
+        if (OtgMasterState.mountedDrives.isEmpty()) {
+            app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.revokeLeftoverGrants(applicationContext)
+        }
+        // Keeps the process unfrozen while anything is mounted (MountedDriveService).
+        OtgMasterState.onMountedChanged = { drives ->
+            MountedDriveService.update(applicationContext, drives.map(::driveTitle))
+            if (drives.size == 1) runOnUiThread { if (!isFinishing) askForNotificationsOnce() }
+            app.fayaz.otgmaster.provider.VeraCryptDocumentProvider
+                .revokeExtendedGrants(applicationContext, drives.map { it.id }.toSet())
+        }
+        MountedDriveService.update(applicationContext, OtgMasterState.mountedDrives.map(::driveTitle))
+        // Format and Encrypt keep the service in the foreground for their whole run, with
+        // their progress in its notification, and post a notice when they end.
+        lifecycleScope.launch {
+            androidx.compose.runtime.snapshotFlow { driveOperation.value }.collect { op ->
+                when {
+                    op == null -> Unit // the result was dismissed
+                    op.finished -> MountedDriveService.operationFinished(applicationContext, op.title,
+                        op.error ?: op.phase, failed = op.error != null)
+                    else -> MountedDriveService.operationProgress(applicationContext,
+                        MountedDriveService.Operation(op.title, op.phase, op.fraction))
+                }
+            }
+        }
+
+        val usbMgr = getSystemService(Context.USB_SERVICE) as UsbManager
+        usbDeviceProvider = RealUsbDeviceProvider(usbMgr, permissionIntent)
+
+        registerUsbReceiver()
+
+        // Let components without an activity reference write to the log pane.
+        installedLogSink = { line -> runOnUiThread { appendLog(line) } }
+        OtgMasterState.logSink = installedLogSink
+
+        installedUnmountAll = {
+            // Timed because an unmount on a Huawei P20 Lite took over 90s to be
+            // observed by the benchmark, with no app log at all in that window and
+            // everything firing at once the moment the wait expired. removeDrive is
+            // synchronous, so the mount list should empty the instant this body
+            // runs — which means the body was not running. These timestamps say
+            // whether the delay is before the post is serviced (main thread busy)
+            // or inside unmountDrive itself.
+            val posted = System.currentTimeMillis()
+            android.util.Log.i("OTGMaster", "unmountAll: posted to main thread")
+            runOnUiThread {
+                val entered = System.currentTimeMillis()
+                android.util.Log.i("OTGMaster",
+                    "unmountAll: main thread entered after ${entered - posted}ms")
+                OtgMasterState.mountedDrives.toList().forEach { unmountDrive(it) }
+                android.util.Log.i("OTGMaster",
+                    "unmountAll: done in ${System.currentTimeMillis() - entered}ms, " +
+                    "${OtgMasterState.mountedDrives.size} drive(s) still listed")
+            }
+        }
+        OtgMasterState.unmountAllRequest = installedUnmountAll
+        installedDetachRequest = { deviceKey ->
+            runOnUiThread {
+                handleDetach { it == deviceKey }
+                appendLog(getString(R.string.log_usb_device_detached))
+                refreshDevices()
+            }
+        }
+        OtgMasterState.detachRequest = installedDetachRequest
+
+        installedMountRequest = OtgMasterState.MountRequest { pw, pim, cipherName, hashName, readOnly ->
+            // Open and probe every attached drive not already held, whether or not
+            // anything is listed. Without a probe the request depended on the UI having
+            // scanned, which does not happen while the screen is off or locked. And it
+            // used to probe only when no candidates were listed at all: after the
+            // benchmark's unmount-everything remount with two drives attached, the
+            // second drive's still-locked candidates kept the list non-empty, the first
+            // drive's closed connection was never reopened, and every partition on it
+            // was gone for the rest of the run (OnePlus 7, device-matrix Drives 1 + 2).
+            lifecycleScope.launch {
+                reprobeHeldDevices()
+                openAndProbeUsb(quietIfNone = true)
+                withTimeoutOrNull(25_000) {
+                    while (isProbingDevices || _deviceCandidates.value.isEmpty()) delay(300)
+                }
+                mountProbedCandidates(pw, pim, cipherName, hashName, readOnly)
+            }
+        }
+        OtgMasterState.mountRequest = installedMountRequest
+        
+        sharedPreferences = getSharedPreferences("otgmaster_prefs", Context.MODE_PRIVATE)
+        val savedTheme = sharedPreferences.getString("theme_mode", ThemeMode.SYSTEM.name)
+        _themeMode.value = ThemeMode.valueOf(savedTheme ?: ThemeMode.SYSTEM.name)
+        credentialStore = app.fayaz.otgmaster.security.CredentialStore(this)
+        autoMountEnabled.value = sharedPreferences.getBoolean("auto_mount", false)
+        excludedDeviceKeys.value = credentialStore.loadExcludedKeys()
+        readOnlyDefault.value = sharedPreferences.getBoolean(PREF_READ_ONLY_DEFAULT, false)
+        readOnlyChoices.value = sharedPreferences.getStringSet(PREF_READ_ONLY_CHOICES, emptySet()).orEmpty()
+            .mapNotNull { e -> e.substringBeforeLast('|', "").takeIf { it.isNotEmpty() }?.let { it to e.endsWith("|1") } }
+            .toMap()
+        loadManuallyUnmountedDevices(usbMgr)
+
+        setContent {
+            val themeMode = _themeMode.value
+            val isDarkTheme = when (themeMode) {
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+            }
+            // Hold the display on while a benchmark runs. The bench screen does this
+            // for itself, but the mount pre-flight can bring this activity forward, and
+            // the flag belongs to whichever window is actually in front.
+            androidx.compose.runtime.LaunchedEffect(isDarkTheme) { applySystemBarAppearance(isDarkTheme) }
+            val benchRunning = OtgMasterState.benchmarkRunning.value
+            androidx.compose.runtime.LaunchedEffect(benchRunning) {
+                if (benchRunning) {
+                    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+            MaterialTheme(
+                colorScheme = if (isDarkTheme) darkColorScheme() else lightColorScheme()
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    OtgMasterApp(
+                        deviceCandidates = _deviceCandidates.value,
+                        mountedDrives = mountedDrivesState.value,
+                        logs = logsState,
+                        themeMode = themeMode,
+                        versionName = versionName,
+                        versionCode = versionCode,
+                        formResetKey = mountFormResetKey.value,
+                        autoMountEnabled = autoMountEnabled.value,
+                        sessionCredentials = sessionPlaintextCreds,
+                        hasCachedCreds = { deviceKey, startBlock ->
+                            if (startBlock == null) credentialStore.hasAny(deviceKey)
+                            else credentialStore.load(deviceKey, startBlock) != null
+                        },
+                        isExcluded = { deviceKey -> deviceKey in excludedDeviceKeys.value },
+                        readOnlyDefault = readOnlyDefault.value,
+                        onReadOnlyDefaultChange = { enabled ->
+                            readOnlyDefault.value = enabled
+                            sharedPreferences.edit().putBoolean(PREF_READ_ONLY_DEFAULT, enabled).apply()
+                        },
+                        isPartitionReadOnly = { deviceKey, startBlock -> isPartitionReadOnly(deviceKey, startBlock) },
+                        onSetPartitionReadOnly = { deviceKey, startBlock, ro -> setPartitionReadOnly(deviceKey, startBlock, ro) },
+                        onRefreshDevices = {
+                            refreshDevices()
+                            scanFoundNoDrive.value = usbDeviceProvider.getDevices()
+                                .none { UsbDeviceDescriber.isMassStorageDevice(it) }
+                        },
+                        showNoDriveHelp = scanFoundNoDrive.value,
+                        onUnlock = { deviceName, candidate, pwd, pim, keyfiles, cipher, hash, onComplete ->
+                            attemptUnlock(deviceName, candidate, pwd, pim, keyfiles, cipher, hash, onComplete = onComplete)
+                        },
+                        onUnmount = { drive -> unmountDrive(drive, isManual = true) },
+                        onOpenFilesApp = { drive -> openFilesApp(drive) },
+                        journalRepairPrompt = journalRepairPrompt.value,
+                        journalRepairs = journalRepairs.intValue,
+                        onRequestJournalRepair = { drive -> journalRepairPrompt.value = drive.id },
+                        onJournalRepair = { drive -> repairJournal(drive) },
+                        onJournalRepairDismiss = { journalRepairPrompt.value = null },
+                        onClearLogs = { clearLogs() },
+                        onCopyText = { text, label -> copyText(text, label) },
+                        onThemeChange = { newMode ->
+                            _themeMode.value = newMode
+                            sharedPreferences.edit().putString("theme_mode", newMode.name).apply()
+                        },
+                        onAutoMountEnabledChange = { enabled ->
+                            autoMountEnabled.value = enabled
+                            sharedPreferences.edit().putBoolean("auto_mount", enabled).apply()
+                            if (!enabled) {
+                                credentialStore.clearAll()
+                                sessionPlaintextCreds.clear()
+                                appendLog(getString(R.string.log_auto_mount_credentials_cleared))
+                            }
+                        },
+                        onClearAllCredentials = {
+                            credentialStore.clearAll()
+                            sessionPlaintextCreds.clear()
+                            appendLog(getString(R.string.log_auto_mount_credentials_cleared))
+                        },
+                        onClearDeviceCreds = { deviceKey ->
+                            credentialStore.deleteAll(deviceKey)
+                            sessionPlaintextCreds.remove(deviceKey)
+                            appendLog(getString(R.string.log_credentials_cleared_for, deviceKey))
+                        },
+                        onSetExcluded = { deviceKey, excluded ->
+                            credentialStore.setExcluded(deviceKey, excluded)
+                            excludedDeviceKeys.value = credentialStore.loadExcludedKeys()
+                        },
+                        onQuickUnlock = { deviceName, candidate, onComplete ->
+                            showQuickUnlockPrompt(deviceName, candidate, onComplete)
+                        },
+                        toastMessage = toastState.value?.first,
+                        toastIsSuccess = toastState.value?.second ?: true,
+                        onToastDismiss = { toastState.value = null },
+                        newlyMountedDriveIds = newlyMountedDriveIds.value,
+                        onHighlightConsumed = { driveId -> newlyMountedDriveIds.value = newlyMountedDriveIds.value - driveId },
+                        formatUnavailable = { formatUnavailable(it) },
+                        encryptUnavailable = { encryptUnavailable(it) },
+                        driveSummary = { driveSummary(it) },
+                        onFormat = { drive, req -> formatDrive(drive, req) },
+                        onEncrypt = { drive, req -> encryptDrive(drive, req) },
+                        driveOperation = driveOperation.value,
+                        onDriveOperationClose = { driveOperation.value = null },
+                        disconnectedDrives = OtgMasterState.disconnectedDrives.value,
+                        disconnectHistory = OtgMasterState.disconnectHistory.value,
+                        onDismissDisconnected = { OtgMasterState.dismissDisconnected(it) },
+                    )
+                }
+            }
+        }
+        
+        updateMountedDrives()
+        refreshDevices()
+        handleShareIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            refreshDevices()
+        }
+        handleShareIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Backstop for a prompt that never delivered a callback — most often because the
+        // screen locked while it was up, which dismisses it silently. Once we are resumed
+        // there is nothing left to hide the form behind, so clear the flag and put the
+        // candidates back. A spurious restore only costs the cosmetic flash the deferral
+        // was avoiding; not restoring leaves the form permanently missing.
+        isAutoMountPromptShowing = false
+        restoreDeferredCandidates()
+    }
+
+    // The handlers this instance installed, so onDestroy can tell them apart from a
+    // successor's. See onDestroy.
+    private var installedMountRequest: OtgMasterState.MountRequest? = null
+    private var installedUnmountAll: (() -> Unit)? = null
+    private var installedDetachRequest: ((String) -> Unit)? = null
+    private var installedLogSink: ((String) -> Unit)? = null
+
+    override fun onDestroy() {
+        // Clear only what *this* instance installed. Nulling unconditionally let a
+        // finishing instance wipe the handlers its replacement had already
+        // installed, because onCreate of the new one can run before onDestroy of
+        // the old. The app then sat visible and focused with no mount path at all:
+        // the benchmark reported "no mount handler installed — is MainActivity
+        // running?" twice in a row with MainActivity on screen. A user reaches the
+        // same state by backing out and relaunching straight away.
+        if (OtgMasterState.logSink === installedLogSink) OtgMasterState.logSink = null
+        if (OtgMasterState.mountRequest === installedMountRequest) OtgMasterState.mountRequest = null
+        if (OtgMasterState.unmountAllRequest === installedUnmountAll) OtgMasterState.unmountAllRequest = null
+        if (OtgMasterState.detachRequest === installedDetachRequest) OtgMasterState.detachRequest = null
+        installedLogSink = null
+        installedMountRequest = null
+        installedUnmountAll = null
+        installedDetachRequest = null
+        closeOpenedDevices()
+        unregisterReceiver(usbReceiver)
+        super.onDestroy()
+    }
+
+    /**
+     * Closes USB connections this activity opened, except any a mounted drive is
+     * still using.
+     *
+     * refreshDevices has carried this guard since 4458c6d — "never touch a device a
+     * mounted drive is using" — but onDestroy did not, and closed everything. That
+     * kills a live mount whenever the activity is destroyed: a configuration change,
+     * or memory pressure while another screen is in front. Observed on a Huawei P20
+     * Lite (Android 9), where opening the on-device benchmark backgrounded this
+     * activity, Android destroyed it, and the running benchmark then failed every
+     * read with "USB block device is closed".
+     *
+     * Leaving a connection open when the activity dies is the lesser problem: the
+     * drive stays usable, MountedDrive still holds it, and the OS reclaims it when the
+     * process ends. Closing it takes the volume down under whoever is reading.
+     */
+    private fun closeOpenedDevices() {
+        val inUse = OtgMasterState.mountedDrives.mapNotNull { it.sourceDeviceName }.toSet()
+        val releasable = openedDevices.filterKeys { it !in inUse }
+        releasable.forEach { (key, device) ->
+            device.close()
+            openedDevices.remove(key)
+        }
+        if (openedDevices.isNotEmpty()) {
+            Log.i(TAG, "kept ${openedDevices.size} USB connection(s) open for mounted drives")
+        }
+    }
+
+    private fun registerUsbReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(REQUEST_USB_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(usbReceiver, filter)
+        }
+    }
+
+    /**
+     * True while any partition of [key] is still being unmounted.
+     *
+     * Each unmount calls refreshDevices when it finishes, including the first of
+     * several on one device. Re-opening the device then gave it a second connection
+     * while the remaining partitions were still flushing through the first, and the
+     * new connection claiming the interface is what kills the old one. Waiting for
+     * the last unmount to finish costs nothing: that one refreshes too.
+     */
+    private fun isUnmounting(key: String): Boolean = (pendingUnmounts[key] ?: 0) > 0
+
+    /** Key for a partition: the same device key + start block saved credentials use. */
+    private fun partitionKey(deviceKey: String, startBlock: Long) = "$deviceKey@$startBlock"
+
+    /**
+     * Whether this partition mounts read-only: its own choice from the unlock form
+     * if it has one, otherwise the Read-only mode setting. Read by attemptUnlock for
+     * the form, quick unlock and the programmatic mount request. Auto mount uses the
+     * setting alone (readOnlyOverride), since it shows no form.
+     */
+    private fun isPartitionReadOnly(deviceKey: String, startBlock: Long): Boolean =
+        readOnlyChoices.value[partitionKey(deviceKey, startBlock)] ?: readOnlyDefault.value
+
+    private fun setPartitionReadOnly(deviceKey: String, startBlock: Long, readOnly: Boolean) {
+        val updated = readOnlyChoices.value + (partitionKey(deviceKey, startBlock) to readOnly)
+        readOnlyChoices.value = updated
+        sharedPreferences.edit().putStringSet(PREF_READ_ONLY_CHOICES,
+            updated.map { (k, v) -> "$k|${if (v) 1 else 0}" }.toSet()).apply()
+    }
+
+    /** Identity of a connection object, for tracing which one a code path holds. */
+    private fun objId(o: Any?): String =
+        if (o == null) "null" else Integer.toHexString(System.identityHashCode(o))
+
+    /** The hints last logged for an empty device list, so a refresh does not repeat them. */
+    private var lastNoDeviceHints: List<UsbHostDiagnosis.Hint>? = null
+
+    /**
+     * Says why the phone may be listing no USB device: "Found 0 USB devices" was the
+     * whole log in several reports (#8, #23, #26). Logged once until it changes.
+     */
+    private fun logNoDeviceHints() {
+        val state = runCatching { UsbHostDiagnosis.read(this) }.getOrNull() ?: return
+        val hints = UsbHostDiagnosis.hints(state)
+        if (hints == lastNoDeviceHints) return
+        lastNoDeviceHints = hints
+        for (hint in hints) appendLog(when (hint) {
+            UsbHostDiagnosis.Hint.NO_HOST_SUPPORT -> getString(R.string.log_hint_no_usb_host)
+            UsbHostDiagnosis.Hint.CONNECTED_TO_COMPUTER -> getString(R.string.log_hint_connected_to_computer)
+            UsbHostDiagnosis.Hint.CHARGING_FROM_PORT -> getString(R.string.log_hint_charging_from_port)
+            UsbHostDiagnosis.Hint.OTG_SWITCH -> getString(R.string.log_hint_otg_switch, state.manufacturer)
+            UsbHostDiagnosis.Hint.OTG_SWITCH_OFF -> getString(R.string.log_hint_otg_switch_off)
+        })
+    }
+
+    private fun refreshDevices() {
+        val devices = usbDeviceProvider.getDevices()
+        appendLog(getString(R.string.log_found_usb_devices, devices.size))
+
+        val mountedDeviceKeys = OtgMasterState.mountedDrives.mapNotNull { it.sourceDeviceName }.toSet()
+
+        // Drop any previously-opened, not-yet-mounted device that's no longer attached.
+        //
+        // Two guards, because getting this wrong closes a live connection:
+        //
+        // 1. Never touch a device a mounted drive is using. Closing it left the
+        //    MountedDrive holding a dead handle, and reads then failed silently —
+        //    ExFatFile.read swallows the error — so the volume appeared empty
+        //    rather than erroring.
+        //
+        // 2. Match on vendor:product rather than the full key. stableKey embeds the
+        //    serial number only when permission is held, and falls back to the
+        //    device path otherwise, so the SAME device yields two different keys
+        //    depending on permission state. openedDevices stores the serial form;
+        //    recomputing here with permission momentarily unavailable produced the
+        //    path form, no match, and the device was closed as "stale".
+        val attachedKeys = devices.map { UsbDeviceDescriber.stableKey(it, usbDeviceProvider.hasPermission(it)) }.toSet()
+        val attachedIds = devices.map { "${it.vendorId}:${it.productId}" }.toSet()
+        fun vendorProductOf(key: String): String = key.split(":").take(2).joinToString(":")
+        val staleKeys = openedDevices.keys.filter { key ->
+            key != QEMU_DEVICE_KEY &&
+                key !in mountedDeviceKeys &&
+                key !in attachedKeys &&
+                vendorProductOf(key) !in attachedIds
+        }
+        if (staleKeys.isNotEmpty()) {
+            staleKeys.forEach { key -> openedDevices.remove(key)?.close() }
+            _deviceCandidates.value = _deviceCandidates.value.filterNot { it.deviceName in staleKeys }
+        }
+
+        reofferPartlyMountedDevices(mountedDeviceKeys)
+
+        if (devices.isEmpty()) {
+            val qemuAlreadyHandled = QEMU_DEVICE_KEY in mountedDeviceKeys ||
+                QEMU_DEVICE_KEY in openedDevices ||
+                isQemuProbing
+            if (!qemuAlreadyHandled) {
+                val sda = java.io.File("/dev/block/sda")
+                if (sda.exists() && sda.canRead()) {
+                    probeQemuDisk(sda)
+                    return
+                }
+                _deviceCandidates.value = emptyList()
+                appendLog(getString(R.string.log_no_usb_devices))
+                logNoDeviceHints()
+            }
+            return
+        }
+        lastNoDeviceHints = null
+
+        mountMtpDevices(devices, mountedDeviceKeys)
+
+        // Devices not already mounted, not already sitting in the dropdown unprobed, and
+        // that actually expose a mass-storage interface (skips USB hubs/keyboards/etc.).
+        val candidateDevices = devices.filter {
+            val key = UsbDeviceDescriber.stableKey(it, usbDeviceProvider.hasPermission(it))
+            key !in mountedDeviceKeys && key !in openedDevices && !isUnmounting(key) &&
+                UsbDeviceDescriber.isMassStorageDevice(it)
+        }
+        if (candidateDevices.isEmpty()) return
+
+        val deviceNeedingPermission = candidateDevices.firstOrNull { !usbDeviceProvider.hasPermission(it) }
+        if (deviceNeedingPermission != null) {
+            usbDeviceProvider.requestPermission(deviceNeedingPermission, permissionIntent)
+            appendLog(getString(R.string.log_requested_usb_permission))
+        } else {
+            openAndProbeUsb()
+        }
+    }
+
+    /** MTP devices being opened, so a second scan does not open one twice. */
+    private val mtpInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Another phone or a camera over USB (MTP/PTP): each storage it reports is mounted
+     * read-only as a drive (mtp/MtpFileSystem). The phone must be unlocked and set to
+     * "File transfer"; if Android's own file-transfer service already holds the device,
+     * opening fails and the log says so.
+     */
+    private fun mountMtpDevices(devices: List<UsbDevice>, mountedKeys: Set<String>) {
+        for (d in devices) {
+            if (!app.fayaz.otgmaster.mtp.MtpSession.isMtpDevice(d) || UsbDeviceDescriber.isMassStorageDevice(d)) continue
+            val has = usbDeviceProvider.hasPermission(d)
+            val key = UsbDeviceDescriber.stableKey(d, has)
+            if (key in mountedKeys || !mtpInFlight.add(key)) continue
+            if (!has) {
+                mtpInFlight.remove(key)
+                usbDeviceProvider.requestPermission(d, permissionIntent)
+                appendLog(getString(R.string.log_requested_usb_permission))
+                return
+            }
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+                    val connection = usb.openDevice(d) ?: throw java.io.IOException("Android would not open the USB device")
+                    val mtp = android.mtp.MtpDevice(d)
+                    if (!mtp.open(connection)) {
+                        connection.close()
+                        throw java.io.IOException("the device refused an MTP session: unlock it, choose File transfer, " +
+                            "and close any other app showing its files")
+                    }
+                    val session = app.fayaz.otgmaster.mtp.MtpSession(d, mtp)
+                    val storages = session.storages()
+                    if (storages.isEmpty()) throw java.io.IOException("${session.name} reports no storage (is it unlocked?)")
+                    val drives = storages.map { fs ->
+                        val id = app.fayaz.otgmaster.extension.ExtensionContract.stableDriveId(
+                            key, fs.storageId.toLong() and 0xFFFFFFFFL, OtgMasterState.mountedDrives.map { it.id })
+                        MountedDrive(
+                            id = id,
+                            name = "${session.name} · ${fs.volumeLabel}",
+                            fileSystem = fs,
+                            blockDevice = null,
+                            sourceDeviceName = key,
+                            sourceDeviceDisplayName = session.name,
+                            isPlain = true,
+                            partitionLabel = fs.volumeLabel,
+                            filesystemName = "MTP",
+                            mountedReadOnly = true,
+                        ).also { OtgMasterState.addDrive(it) }
+                    }
+                    withContext(Dispatchers.Main) {
+                        appendLog("Mounted ${session.name} over MTP, read-only: ${drives.joinToString { it.partitionLabel }}")
+                        contentResolver.notifyChange(android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null)
+                        newlyMountedDriveIds.value = newlyMountedDriveIds.value + drives.map { it.id }
+                        updateMountedDrives()
+                    }
+                } catch (e: Exception) {
+                    OtgMasterState.logFailure("mtp", "Could not open ${UsbDeviceDescriber.friendlyName(d, 0)} over MTP", e)
+                } finally {
+                    mtpInFlight.remove(key)
+                }
+            }
+        }
+    }
+
+    /** Devices being re-probed by [reofferPartlyMountedDevices], so it runs once per device. */
+    private val reofferInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Offers the still-locked partitions of a device that already has a partition
+     * mounted, when this activity has no form entry for it.
+     *
+     * Mounts outlive the activity (they live in OtgMasterState), the form does not.
+     * refreshDevices skips any device with a mounted partition — rightly, since
+     * opening it again would claim the USB interface and kill the live mount — so a
+     * recreated activity (rotation, memory pressure, leaving and coming back) never
+     * re-offered the other partitions: on a drive with a plain partition beside an
+     * encrypted one, the encrypted one showed "No USB drives available to mount"
+     * until the drive was replugged. Found by the partitioned_mbr E2E case, whose
+     * test relaunches the activity between its two test methods.
+     *
+     * The probe reads through the mounted drive's own connection, under deviceMutex,
+     * and never opens a new one.
+     */
+    private fun reofferPartlyMountedDevices(mountedDeviceKeys: Set<String>) {
+        val offered = _deviceCandidates.value.map { it.deviceName }.toSet()
+        for (key in mountedDeviceKeys) {
+            if (key in offered || isUnmounting(key) || !reofferInFlight.add(key)) continue
+            val drives = OtgMasterState.mountedDrives.filter { it.sourceDeviceName == key }
+            val raw = drives.firstNotNullOfOrNull { it.rawBlockDevice }
+            if (raw == null) { reofferInFlight.remove(key); continue }
+            val display = drives.firstNotNullOfOrNull { it.sourceDeviceDisplayName } ?: key
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val probed = deviceMutex.withLock {
+                        app.fayaz.otgmaster.veracrypt.VeraCryptUnlocker().probeCandidates(raw)
+                    }
+                    val mountedLabels = OtgMasterState.mountedDrives
+                        .filter { it.sourceDeviceName == key }.map { it.partitionLabel }.toSet()
+                    val mountedStarts = OtgMasterState.mountedDrives
+                        .filter { it.sourceDeviceName == key }
+                        .mapNotNull { it.sourceVolumeCandidate?.startBlock }.toSet()
+                    val locked = probed.filter {
+                        it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNKNOWN &&
+                            it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED &&
+                            it.label !in mountedLabels && it.startBlock !in mountedStarts
+                    }
+                    withContext(Dispatchers.Main) {
+                        if (locked.isNotEmpty() && _deviceCandidates.value.none { it.deviceName == key }) {
+                            openedDevices.putIfAbsent(key, raw)
+                            _deviceCandidates.value = _deviceCandidates.value +
+                                UsbDeviceCandidate(key, display, raw, locked, emptyList(), probed.size - locked.size)
+                            appendLog(getString(R.string.log_reoffered_locked_partitions, locked.size, display))
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "re-probe of partly mounted $key failed", e)
+                    OtgMasterState.logFailure("probe", "Re-reading the partitions of $key failed", e)
+                } finally {
+                    reofferInFlight.remove(key)
+                }
+            }
+        }
+    }
+
+    private fun probeQemuDisk(sda: java.io.File) {
+        isQemuProbing = true
+        val device = app.fayaz.otgmaster.block.FileBlockDevice(sda)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val allCandidates = app.fayaz.otgmaster.veracrypt.VeraCryptUnlocker().probeCandidates(device)
+                val plainPartitions = detectPlainPartitions(device, allCandidates)
+                // Only show candidates the picker can actually act on. UNENCRYPTED has
+                // nothing to unlock — it is either auto-mounted as a plain partition or
+                // its filesystem is unsupported — and UNKNOWN means the probe could not
+                // identify it at all.
+                val candidates = allCandidates.filter {
+                    it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNKNOWN &&
+                    it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED
+                }
+                withContext(Dispatchers.Main) {
+                    isQemuProbing = false
+                    val qemuCandidate = UsbDeviceCandidate(QEMU_DEVICE_KEY, getString(R.string.qemu_test_disk_label), device, candidates, plainPartitions, allCandidates.size - candidates.size)
+                    openedDevices[QEMU_DEVICE_KEY] = device
+                    if (plainPartitions.isNotEmpty()) {
+                        mountPlainDevice(qemuCandidate, plainPartitions.first())
+                    }
+                    // Strip plain-partition offsets so the form only shows encrypted candidates
+                    // (mirrors the USB mixed-device path). If there are no plain partitions this
+                    // is a no-op and all candidates are passed through as before.
+                    val plainStarts = plainPartitions.map { it.startBlock }.toSet()
+                    val encryptedCandidates = candidates.filter { it.startBlock !in plainStarts }
+                    if (encryptedCandidates.isNotEmpty()) {
+                        val encryptedQemuCandidate = qemuCandidate.copy(candidates = encryptedCandidates)
+                        appendLog(getString(R.string.log_found_candidates_qemu, encryptedCandidates.size))
+                        val toAutoMountNames = filterAutoMountCandidates(listOf(encryptedQemuCandidate))
+                            .map { it.deviceName }.toSet()
+                        if (encryptedQemuCandidate.deviceName !in toAutoMountNames) {
+                            _deviceCandidates.value = listOf(encryptedQemuCandidate)
+                        }
+                        triggerAutoMount(listOf(encryptedQemuCandidate))
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                device.close()
+                withContext(Dispatchers.Main) {
+                    isQemuProbing = false
+                    appendLog(getString(R.string.log_error_probing_qemu_candidates, e.reason()))
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens and probes every newly-attached device not already mounted or already sitting
+     * in [_deviceCandidates], adding results to the dropdown rather than replacing it, so an
+     * in-progress unlock attempt on one device isn't disturbed by a second device appearing.
+     */
+    /** @param quietIfNone say nothing when every attached drive is already open. */
+    private fun openAndProbeUsb(quietIfNone: Boolean = false) {
+        // Rapid repeated ATTACHED broadcasts (e.g. a flaky OTG connection re-enumerating)
+        // could otherwise start several overlapping probes that all race to open and add
+        // the same physical device, producing duplicate dropdown entries — most of which
+        // lose the race for the underlying connection and end up broken.
+        if (isProbingDevices) return
+        isProbingDevices = true
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val excludeKeys = OtgMasterState.mountedDrives.mapNotNull { it.sourceDeviceName }.toSet() +
+                    openedDevices.keys + pendingUnmounts.filterValues { it > 0 }.keys
+                val opener = LibaumsRawBlockDeviceOpener(this@MainActivity)
+                val openedList = try {
+                    opener.openAllAvailable(excludeKeys).also {
+                        // Every device not opened says why, whether or not another one opened.
+                        val reasons = opener.notOpened.toList()
+                        if (reasons.isNotEmpty()) withContext(Dispatchers.Main) {
+                            reasons.forEach { appendLog(getString(R.string.log_could_not_open_device, it)) }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) { appendLog(getString(R.string.log_error_probing_candidates, e.reason())) }
+                    return@launch
+                }
+
+                if (openedList.isEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        // Every attached device was filtered out as already open. If any of
+                        // them are sitting in deferredCandidates, an earlier auto-mount
+                        // prompt never resolved — surface them rather than reporting
+                        // failure, so Scan works as a recovery action.
+                        if (deferredCandidates.isNotEmpty()) {
+                            restoreDeferredCandidates()
+                        } else if (!quietIfNone && opener.notOpened.isEmpty()) {
+                            appendLog(getString(R.string.log_could_not_open_block_device))
+                        }
+                    }
+                    return@launch
+                }
+
+                val baseIndex = _deviceCandidates.value.size
+                openedList.forEach {
+                    android.util.Log.i("OTGMaster", "probe opened ${it.deviceKey} as ${objId(it.blockDevice)}")
+                }
+                val skippedLines = mutableListOf<String>()
+                val newCandidates = openedList.mapIndexed { index, opened ->
+                    val displayName = UsbDeviceDescriber.friendlyName(opened.usbDevice, baseIndex + index)
+                    val allCandidates = try {
+                        VeraCryptUnlocker().probeCandidates(opened.blockDevice)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        OtgMasterState.logFailure("probe", "Reading the partition table of $displayName failed", e)
+                        emptyList()
+                    }
+                    // Detect plain filesystems on IO thread (readBlocks is blocking).
+                    val plainPartitions = detectPlainPartitions(opened.blockDevice, allCandidates)
+                    // Only show candidates the picker can actually act on. UNENCRYPTED has
+                    // nothing to unlock — it is either auto-mounted as a plain partition or
+                    // its filesystem is unsupported — and UNKNOWN means the probe could not
+                    // identify it at all.
+                    val candidates = allCandidates.filter {
+                        it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNKNOWN &&
+                        it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED
+                    }
+                    // Partitions neither mounted nor offered, one line each, so a drive with
+                    // "missing" partitions says why (and so does a report sent from it).
+                    val skipped = app.fayaz.otgmaster.fs.SkippedPartitions.lines(
+                        allCandidates, plainPartitions.map { it.startBlock }.toSet(),
+                        opened.blockDevice.blockSize, ::formatSize,
+                    ) { c ->
+                        runCatching {
+                            app.fayaz.otgmaster.fs.FilesystemDetector.detectFromBytes(
+                                opened.blockDevice.readBlocks(c.startBlock,
+                                    minOf(4L, opened.blockDevice.blockCount - c.startBlock).toInt()))
+                        }.getOrDefault(app.fayaz.otgmaster.fs.DetectedFilesystem.Unknown)
+                    }
+                    skipped.forEach { skippedLines += "$displayName · $it" }
+                    UsbDeviceCandidate(opened.deviceKey, displayName, opened.blockDevice, candidates, plainPartitions, allCandidates.size - candidates.size)
+                }
+
+                withContext(Dispatchers.Main) {
+                    skippedLines.forEach { appendLog(it) }
+                    val existingKeys = _deviceCandidates.value.map { it.deviceName }.toSet()
+                    val (uniqueNew, duplicates) = newCandidates.partition { it.deviceName !in existingKeys }
+                    // Close rather than leak the redundant connections opened for devices
+                    // that turned out to already be in the dropdown by the time we got here.
+                    duplicates.forEach { it.blockDevice.close() }
+
+                    // Classify each device:
+                    //  - purePlain:  every candidate is a recognised plain FS → auto-mount all
+                    //  - mixed:      has both plain and encrypted candidates → auto-mount plain
+                    //                partitions AND show VeraCrypt form for the encrypted ones
+                    //  - pureEncrypted: no plain candidates → VeraCrypt form only
+                    val (hasPlain, pureEncrypted) = uniqueNew.partition { it.plainPartitions.isNotEmpty() }
+                    val (purePlain, mixed) = hasPlain.partition { device ->
+                        val plainStarts = device.plainPartitions.map { it.startBlock }.toSet()
+                        device.candidates.all { it.startBlock in plainStarts }
+                    }
+
+                    // Auto-mount ALL plain partitions on pure-plain and mixed devices
+                    (purePlain + mixed).forEach { candidate ->
+                        openedDevices[candidate.deviceName] = candidate.blockDevice
+                        candidate.plainPartitions.forEach { plain ->
+                            mountPlainDevice(candidate, plain)
+                        }
+                    }
+
+                    // For mixed devices, strip out the already-mounted plain candidates so
+                    // the VeraCrypt form only shows the encrypted partitions still to unlock.
+                    val mixedEncrypted = mixed.map { device ->
+                        val plainStarts = device.plainPartitions.map { it.startBlock }.toSet()
+                        val kept = device.candidates.filter { it.startBlock !in plainStarts }
+                        device.copy(
+                            candidates = kept,
+                            hiddenPartitions = device.hiddenPartitions + (device.candidates.size - kept.size),
+                        )
+                    }
+
+                    val encryptedNew = pureEncrypted + mixedEncrypted
+                    encryptedNew.forEach { openedDevices[it.deviceName] = it.blockDevice }
+                    // Defer auto-mount candidates from _deviceCandidates so the form doesn't
+                    // flash while waiting for the biometric prompt. They'll be added back in
+                    // showAutoMountPrompt once biometric resolves (success or cancel).
+                    val toAutoMountNames = filterAutoMountCandidates(encryptedNew).map { it.deviceName }.toSet()
+                    val manualOnly = encryptedNew.filter { it.deviceName !in toAutoMountNames }
+                    deferCandidates(encryptedNew.filter { it.deviceName in toAutoMountNames })
+                    _deviceCandidates.value = _deviceCandidates.value + manualOnly
+                    if (encryptedNew.isNotEmpty()) {
+                        appendLog(getString(R.string.log_probed_devices, encryptedNew.joinToString(", ") { it.displayName }))
+                        triggerAutoMount(encryptedNew)
+                    }
+
+                }
+            } finally {
+                withContext(Dispatchers.Main) { isProbingDevices = false }
+            }
+        }
+    }
+
+    private fun attemptUnlock(
+        deviceName: String,
+        candidate: VolumeCandidate,
+        password: String,
+        pim: Int?,
+        keyfiles: List<Uri>,
+        cipher: app.fayaz.otgmaster.veracrypt.VeraCryptCipher,
+        hash: app.fayaz.otgmaster.veracrypt.VeraCryptHash,
+        fromCache: Boolean = false,
+        /** Overrides the partition's stored choice; auto mount passes the Settings default. */
+        readOnlyOverride: Boolean? = null,
+        onComplete: () -> Unit
+    ) {
+        // An exception after the success path's onComplete() reached the catch block,
+        // which called it again; the benchmark's unlocks-in-flight count then hit
+        // zero while other unlocks were still running. Once, whichever path ends it.
+        val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val callerOnComplete = onComplete
+        @Suppress("NAME_SHADOWING")
+        val onComplete = { if (completed.compareAndSet(false, true)) callerOnComplete() }
+        val device = openedDevices[deviceName]
+        val readOnly = readOnlyOverride ?: isPartitionReadOnly(deviceName, candidate.startBlock)
+        android.util.Log.i("OTGMaster",
+            "attemptUnlock ${candidate.label} @${candidate.startBlock} via ${objId(device)}")
+        if (device == null) {
+            appendLog(getString(R.string.log_no_block_device_opened))
+            onComplete()
+            return
+        }
+        val deviceDisplayName = _deviceCandidates.value.find { it.deviceName == deviceName }?.displayName ?: deviceName
+
+        appendLog(getString(R.string.log_unlock_attempt, deviceDisplayName, pim.toString(), cipher.displayName, hash.displayName))
+
+        if (!cipher.isSupported || !hash.isSupported) {
+            val unsupportedName = if (!cipher.isSupported) cipher.displayName else hash.displayName
+            appendLog(getString(R.string.log_cannot_mount_unsupported, unsupportedName))
+            onComplete()
+            return
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            deviceMutex.withLock {
+            try {
+                // An UNENCRYPTED candidate has a readable filesystem at its first
+                // sector, so there is no header to derive a key from. Falling
+                // through to the VeraCrypt branch ran 16,000 PBKDF2 iterations
+                // against an NTFS boot sector and then reported "failed to
+                // unlock", which reads as a wrong password rather than the truth.
+                if (candidate.containerType ==
+                        app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED) {
+                    val available = device.blockCount - candidate.startBlock
+                    val plain = if (available <= 0) DetectedFilesystem.Unknown else
+                        FilesystemDetector.detectFromBytes(
+                            device.readBlocks(candidate.startBlock, minOf(4L, available).toInt()))
+                    withContext(Dispatchers.Main) {
+                        onComplete()
+                        appendLog(getString(R.string.log_volume_not_encrypted,
+                            candidate.label, plain.displayName))
+                    }
+                    return@withLock
+                }
+                val decryptedDevice = when (candidate.containerType) {
+                    app.fayaz.otgmaster.veracrypt.ContainerType.LUKS1,
+                    app.fayaz.otgmaster.veracrypt.ContainerType.LUKS2 -> {
+                        val passwordBytes = password.toByteArray(Charsets.UTF_8)
+                        try {
+                            app.fayaz.otgmaster.luks.LuksUnlocker().unlock(
+                                device, candidate.startBlock, candidate.blockCount, passwordBytes
+                            )
+                        } finally {
+                            passwordBytes.fill(0)
+                        }
+                    }
+                    app.fayaz.otgmaster.veracrypt.ContainerType.BITLOCKER ->
+                        app.fayaz.otgmaster.bitlocker.BitLockerUnlocker().unlock(
+                            device, candidate.startBlock, candidate.blockCount, password.toCharArray()
+                        )
+                    // Nothing to decrypt at the block level: libfsapfs takes the
+                    // password when the filesystem is mounted, below.
+                    //
+                    // close() must stop here. Unmounting closes the mount's device
+                    // chain, and a bare SlicedBlockDevice passes close() on to the USB
+                    // connection itself — so unmounting an encrypted APFS volume closed
+                    // the whole stick under every other partition on it, the kernel
+                    // took it back, and Android mounted its plain partitions read-write
+                    // (device-matrix Drive 1, OnePlus 7: every run, at the first
+                    // remount). The other containers' devices do not close the raw one
+                    // either; its lifetime belongs to openedDevices / unmountDrive.
+                    app.fayaz.otgmaster.veracrypt.ContainerType.APFS -> {
+                        val slice = app.fayaz.otgmaster.block.SlicedBlockDevice(device, candidate.startBlock,
+                            candidate.blockCount ?: (device.blockCount - candidate.startBlock))
+                        object : app.fayaz.otgmaster.block.RawBlockDevice by slice {
+                            override fun close() {}
+                        }
+                    }
+                    else -> VeraCryptUnlocker().unlock(
+                        device, candidate, password.toCharArray(), pim, keyfiles, contentResolver,
+                        cipher, hash
+                    )
+                }
+                val isApfs = candidate.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.APFS
+                // APFS is not unlocked until it mounts.
+                if (!isApfs) withContext(Dispatchers.Main) { appendLog(getString(R.string.log_unlock_successful)) }
+
+                val detected = FilesystemDetector.detect(decryptedDevice)
+                withContext(Dispatchers.Main) { appendLog(getString(R.string.log_detected_filesystem, detected.displayName)) }
+
+                if (detected is DetectedFilesystem.Unsupported) {
+                    withContext(Dispatchers.Main) {
+                        onComplete()
+                        appendLog(getString(R.string.log_cannot_mount_reason, detected.reason))
+                    }
+                    return@launch
+                }
+
+                if (detected is DetectedFilesystem.Unknown) {
+                    withContext(Dispatchers.Main) { appendLog(getString(R.string.log_filesystem_unrecognized)) }
+                }
+
+                val dummyEntry = PartitionTableEntry(0, 0, 0)
+                // Read cache with readahead between the filesystem driver and the
+                // decrypted device. libexfat reads directory and FAT entries
+                // unbuffered — measured at 100,844 preads averaging 24 bytes to list
+                // a 10,000-entry directory (docs/IO_PERFORMANCE.md §5.5) — and each
+                // one was a USB round trip plus a sector decryption. Caching
+                // plaintext means a hit skips both.
+                // Readahead helps or hurts depending on the filesystem's metadata
+                // layout — see CachedBlockDevice.NO_READAHEAD_BYTES.
+                val cachedDevice = wrapWithCache(decryptedDevice, detected.displayName)
+                val byteDevice = me.jahnen.libaums.core.driver.ByteBlockDevice(
+                    cachedDevice as me.jahnen.libaums.core.driver.BlockDeviceDriver
+                )
+                val fsDevice: me.jahnen.libaums.core.driver.BlockDeviceDriver =
+                    if (readOnly) app.fayaz.otgmaster.block.ReadOnlyBlockDeviceDriver(byteDevice) else byteDevice
+                val fileSystem = try {
+                    if (isApfs) {
+                        app.fayaz.otgmaster.apfs.ApfsFileSystemCreator.mount(fsDevice, password).also {
+                            withContext(Dispatchers.Main) { appendLog(getString(R.string.log_unlock_successful)) }
+                        }
+                    } else {
+                        FileSystemFactory.createFileSystem(dummyEntry, fsDevice)
+                    }
+                } catch (e: app.fayaz.otgmaster.apfs.ApfsFileSystem.WrongPasswordException) {
+                    throw e   // an unlock failure, reported (and cached credentials dropped) below
+                } catch (e: Exception) {
+                    android.util.Log.e("OTG_MOUNT", "Failed to mount file system", e)
+                    val msg = if (detected is DetectedFilesystem.Unknown)
+                        getString(R.string.log_unrecognized_fs_not_mounted)
+                    else
+                        getString(R.string.log_failed_to_mount, detected.displayName, e.reason())
+                    withContext(Dispatchers.Main) {
+                        onComplete()
+                        appendLog(msg)
+                    }
+                    return@launch
+                }
+                // Stable across mounts, so a companion app's persisted folder grant
+                // still resolves next time (see ExtensionContract).
+                val driveId = app.fayaz.otgmaster.extension.ExtensionContract.stableDriveId(
+                    deviceName, candidate.startBlock, OtgMasterState.mountedDrives.map { it.id })
+                val mountedDrive = MountedDrive(
+                    id = driveId,
+                    name = getString(R.string.mounted_drive_name, deviceDisplayName, driveId),
+                    fileSystem = fileSystem,
+                    blockDevice = cachedDevice,
+                    sourceDeviceName = deviceName,
+                    sourceDeviceDisplayName = deviceDisplayName,
+                    rawBlockDevice = device,
+                    sourceVolumeCandidate = candidate,
+                    partitionLabel = candidate.label,
+                    filesystemName = detected.displayName,
+                    mountedReadOnly = readOnly,
+                    partitionStartBlock = candidate.startBlock,
+                    partitionBlockCount = candidate.blockCount,
+                )
+
+                OtgMasterState.addDrive(mountedDrive)
+                mountedDrive.readOnlyReason?.let { reason ->
+                    withContext(Dispatchers.Main) { appendLog("${mountedDrive.name} is read-only: $reason") }
+                }
+                contentResolver.notifyChange(
+                    android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null
+                )
+                app.fayaz.otgmaster.extension.ExtensionContract.notifyCompanions(
+                    applicationContext, app.fayaz.otgmaster.extension.ExtensionContract.ACTION_VOLUME_MOUNTED, mountedDrive)
+
+                withContext(Dispatchers.Main) {
+                    onComplete()
+                    mountFormResetKey.value++
+                    if (autoMountEnabled.value) {
+                        credentialStore.save(deviceName, candidate.startBlock, password, pim?.toString() ?: "", keyfiles, cipher.name, hash.name, candidate.containerType)
+                        sessionPlaintextCreds[deviceName] = app.fayaz.otgmaster.security.CredentialStore.Credentials(
+                            password, pim?.toString() ?: "", keyfiles, cipher.name, hash.name, candidate.startBlock, candidate.containerType
+                        )
+                        appendLog(getString(R.string.log_credentials_saved, deviceDisplayName))
+                    }
+                    newlyMountedDriveIds.value = newlyMountedDriveIds.value + driveId
+                    pendingToastMountNames.add(deviceDisplayName)
+                    toastMountHandler.removeCallbacks(toastMountRunnable)
+                    toastMountHandler.postDelayed(toastMountRunnable, 300L)
+                    updateMountedDrives()
+                    pushDriveShortcut(mountedDrive)
+                    appendLog(getString(R.string.log_mounted_successfully, deviceDisplayName, fileSystem.capacity / (1024 * 1024)))
+                    // Remove only this candidate; keep others for the same device (multi-partition).
+                    val updatedCandidates = _deviceCandidates.value.map { udc ->
+                        if (udc.deviceName == deviceName)
+                            udc.copy(candidates = udc.candidates.filter { it.startBlock != candidate.startBlock })
+                        else udc
+                    }.filter { it.candidates.isNotEmpty() }
+                    _deviceCandidates.value = updatedCandidates
+                    // Clear in-session pre-fill so the form can use the stored creds for the
+                    // next remaining candidate (hasCachedCreds keeps the quick-unlock button visible).
+                    if (updatedCandidates.any { it.deviceName == deviceName }) {
+                        sessionPlaintextCreds.remove(deviceName)
+                    }
+                    if (updatedCandidates.none { it.deviceName == deviceName }) {
+                        openedDevices.remove(deviceName)
+                        // All partitions mounted — no more candidates remain, so session creds
+                        // are no longer needed and would block auto-mount on next re-plug.
+                        sessionPlaintextCreds.remove(deviceName)
+                    }
+                }
+                // Pick up any newly attached device since the last probe (and prompt for
+                // permission if needed) now that this one is out of the dropdown.
+                withContext(Dispatchers.Main) { refreshDevices() }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    onComplete()
+                    // An I/O error says nothing about whether the password is
+                    // right — the USB transport drops under load and the read
+                    // fails long before any key is tested — so it must not throw
+                    // away the user's saved credentials.  Discarding them on any
+                    // exception meant a transport blip silently un-saved a
+                    // partition the user had asked to be remembered.
+                    if (fromCache && e !is java.io.IOException) {
+                        credentialStore.deletePartition(deviceName, candidate.startBlock)
+                        sessionPlaintextCreds.remove(deviceName)
+                        appendLog(getString(R.string.log_cached_credentials_invalid, deviceDisplayName))
+                    }
+                    toastState.value = Pair("Mount failed: ${e.message ?: "Unknown error"}", false)
+                    appendLog(getString(R.string.log_failed_to_unlock, deviceDisplayName, e.reason()))
+                }
+            }
+            }
+        }
+    }
+
+    private fun loadManuallyUnmountedDevices(usbMgr: UsbManager) {
+        // Detect reboot: boot epoch = wall clock minus uptime. If it differs from the saved
+        // value by more than 60 s, the device was rebooted — clear the suppression set so
+        // auto-mount fires again on first open after boot.
+        val bootEpoch = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+        val savedBootEpoch = sharedPreferences.getLong(PREF_LAST_BOOT_TIME, 0L)
+        val rebooted = Math.abs(bootEpoch - savedBootEpoch) > 60_000L
+        if (rebooted) {
+            sharedPreferences.edit()
+                .putStringSet(PREF_MANUALLY_UNMOUNTED, emptySet())
+                .putLong(PREF_LAST_BOOT_TIME, bootEpoch)
+                .apply()
+            return
+        }
+
+        val persisted = sharedPreferences.getStringSet(PREF_MANUALLY_UNMOUNTED, emptySet()) ?: emptySet()
+        // Drop keys whose device is no longer physically attached — it was unplugged while
+        // the app was dead, so the next plug-in should be treated as a fresh connection.
+        val currentKeys = usbMgr.deviceList.values.map {
+            UsbDeviceDescriber.stableKey(it, usbMgr.hasPermission(it))
+        }.toSet()
+        val stillConnected = persisted.filter { it in currentKeys }.toSet()
+        manuallyUnmountedDevices.clear()
+        manuallyUnmountedDevices.addAll(stillConnected)
+        if (stillConnected != persisted) saveManuallyUnmountedDevices()
+    }
+
+    private fun saveManuallyUnmountedDevices() {
+        sharedPreferences.edit().putStringSet(PREF_MANUALLY_UNMOUNTED, manuallyUnmountedDevices.toSet()).apply()
+    }
+
+    /**
+     * Everything a USB device going away undoes, for the devices whose stored keys
+     * [matchesDetached] accepts: suppression flags, session credentials, mounted
+     * partitions (left as disconnected cards) and probed handles.
+     */
+    private fun handleDetach(matchesDetached: (String) -> Boolean) {
+        // Clear suppression flags so the next plug-in triggers auto-mount again.
+        manuallyUnmountedDevices.removeAll { matchesDetached(it) }
+        autoMountAttempted.removeAll { matchesDetached(it) }
+        sessionPlaintextCreds.keys.filter { matchesDetached(it) }.forEach { sessionPlaintextCreds.remove(it) }
+        saveManuallyUnmountedDevices()
+        // Unmount any mounted drives from this device. A drive still mounted
+        // here was not unmounted first: pulled out, or dropped by itself, which
+        // on bus-powered SSD enclosures is usually the phone's port browning out
+        // under load (issue #50). Its card stays, marked disconnected.
+        val lost = OtgMasterState.mountedDrives
+            .filter { it.sourceDeviceName?.let(matchesDetached) == true }
+        if (lost.isNotEmpty()) recordDisconnect(lost)
+        lost.forEach { unmountDrive(it, disconnected = true) }
+        // An MTP device's session is shared by its storages; close it once they are gone.
+        lost.mapNotNull { (it.fileSystem as? app.fayaz.otgmaster.mtp.MtpStorageFileSystem)?.session }.distinct()
+            .forEach { s -> lifecycleScope.launch(Dispatchers.IO) { runCatching { s.close() } } }
+        // Close and discard any probed-but-not-yet-mounted block handles.
+        val keysToClose = openedDevices.keys.filter { matchesDetached(it) }
+        val toClose = keysToClose.mapNotNull { openedDevices.remove(it) }
+        _deviceCandidates.value = _deviceCandidates.value.filterNot { matchesDetached(it.deviceName) }
+        if (toClose.isNotEmpty()) {
+            lifecycleScope.launch(Dispatchers.IO) { toClose.forEach { runCatching { it.close() } } }
+        }
+    }
+
+    /**
+     * Leaves a disconnected card for each of [lost] and says why it may have happened.
+     *
+     * Only the battery is readable here: Android gives apps no view of a hub, or of how
+     * much current the port supplies. A phone plugged into power was most likely feeding
+     * the drive through a powered hub, so it does not get the power advice.
+     */
+    private fun recordDisconnect(lost: List<MountedDrive>) {
+        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = battery?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = battery?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val event = DisconnectEvent(
+            atMillis = System.currentTimeMillis(),
+            batteryPercent = if (level >= 0 && scale > 0) level * 100 / scale else null,
+            externalPower = (battery?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0,
+        )
+        lost.forEach { drive ->
+            OtgMasterState.recordDisconnect(DisconnectedDrive(
+                partitionKey = drive.partitionKey,
+                title = driveTitle(drive),
+                filesystemName = drive.filesystemName,
+                containerType = drive.sourceVolumeCandidate?.containerType,
+                event = event,
+            ))
+        }
+        val names = lost.joinToString { driveTitle(it) }
+        val message = getString(
+            if (event.externalPower) R.string.drive_disconnected_unexpectedly
+            else R.string.drive_disconnected_power_hint,
+            names)
+        appendLog(message)
+        toastState.value = Pair(message, false)
+        // The in-app banner is invisible to someone copying in Files, which is where a
+        // drop mid-transfer happens.
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+            android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun unmountDrive(drive: MountedDrive, isManual: Boolean = false, disconnected: Boolean = false) {
+        if (isManual) {
+            drive.sourceDeviceName?.let {
+                manuallyUnmountedDevices.add(it)
+                saveManuallyUnmountedDevices()
+            }
+        }
+        drive.sourceDeviceName?.let { key ->
+            pendingUnmounts.merge(key, 1) { a, b -> a + b }
+        }
+        OtgMasterState.unmountsInFlight.incrementAndGet()
+        val t0 = System.currentTimeMillis()
+        OtgMasterState.removeDrive(drive.id)
+        val tRemoved = System.currentTimeMillis()
+        contentResolver.notifyChange(
+            android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null
+        )
+        app.fayaz.otgmaster.extension.ExtensionContract.notifyCompanions(
+            applicationContext, app.fayaz.otgmaster.extension.ExtensionContract.ACTION_VOLUME_UNMOUNTED, drive)
+        val tNotified = System.currentTimeMillis()
+        updateMountedDrives()
+        val tUpdated = System.currentTimeMillis()
+        removeDriveShortcut(drive.id)
+        // All of this is main-thread work. updateMountedDrives reads free space,
+        // which is filesystem I/O, and on a slow card through a crypto layer that
+        // is the obvious candidate for a stall — but it runs after removeDrive, so
+        // in principle it cannot delay a waiter watching the mount list. Measured
+        // rather than assumed, because assuming has been wrong twice today.
+        android.util.Log.i("OTGMaster",
+            "unmountDrive ${drive.id}: remove=${tRemoved - t0}ms" +
+            " notify=${tNotified - tRemoved}ms update=${tUpdated - tNotified}ms" +
+            " shortcut=${System.currentTimeMillis() - tUpdated}ms")
+        lifecycleScope.launch(Dispatchers.IO) {
+          try {
+            // Wait for any in-flight ProxyFileDescriptor onRelease() callbacks to finish
+            // before unmounting — prevents a use-after-free if the OS is still flushing a
+            // file write when exfat_unmount frees the ef pointer.
+            app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.drainCallbacks()
+            // Unmounting flushes filesystem metadata, so it writes to the same shared
+            // USB device as every other partition.  Remounting empties the whole mount
+            // list at once, and four concurrent single-block writes killed the
+            // transport with "MAX_RECOVERY_ATTEMPTS Exceeded", which then failed the
+            // unlocks that followed.  Only the device work is serialised —
+            // drainCallbacks() above waits on in-flight file callbacks that can need
+            // the device themselves, so holding the lock across it deadlocks every
+            // later mount and unmount.
+            deviceMutex.withLock {
+                when (val fs = drive.fileSystem) {
+                    is app.fayaz.otgmaster.exfat.ExFatFileSystem -> fs.unmount()
+                    is app.fayaz.otgmaster.ntfs.NtfsFileSystem -> fs.unmount()
+                    is app.fayaz.otgmaster.apfs.ApfsFileSystem -> fs.unmount()
+                    // Leaves the clean flag set; a stream of writes keeps it clear (#36).
+                    is app.fayaz.otgmaster.ext4.Ext4FileSystem -> fs.unmount()
+                }
+                // drive.blockDevice is either NativeDecryptedBlockDevice (close zeros the key but
+                // does NOT close the underlying USB connection) or RawBlockDeviceAdapter (noop close).
+                // The raw USB connection is managed below — closed only when no other partitions remain.
+                drive.blockDevice?.close()
+            }
+            withContext(Dispatchers.Main) {
+                // A green "Unmounted" would overwrite the disconnect warning with good news.
+                if (!disconnected) toastState.value = Pair("Unmounted: ${drive.name}", true)
+                appendLog(getString(R.string.log_drive_unmounted, drive.name))
+
+                val sourceKey = drive.sourceDeviceName
+                val rawDevice = drive.rawBlockDevice
+                val volCandidate = drive.sourceVolumeCandidate
+
+                if (sourceKey != null && rawDevice != null) {
+                    val stillUnmounting = (pendingUnmounts.merge(sourceKey, -1) { a, b -> a + b } ?: 0) > 0
+                    val otherMounted = OtgMasterState.mountedDrives.any { it.sourceDeviceName == sourceKey }
+                    val candidatesInForm = _deviceCandidates.value.any { it.deviceName == sourceKey }
+                    android.util.Log.i("OTGMaster",
+                        "unmountDrive ${drive.id} done: plain=${drive.isPlain} stillUnmounting=$stillUnmounting" +
+                        " otherMounted=$otherMounted candidatesInForm=$candidatesInForm" +
+                        " raw=${objId(rawDevice)} opened=${objId(openedDevices[sourceKey])}")
+
+                    // close() is idempotent, so a connection the detach handler already
+                    // closed is safe to close again. What is not safe is closing one a
+                    // mounted partition still reads through.
+                    val rawInUse = OtgMasterState.mountedDrives.any { it.rawBlockDevice === rawDevice }
+                    val current = openedDevices[sourceKey]
+                    if (current != null && current !== rawDevice) {
+                        // A newer connection to this device already exists. Restoring
+                        // this one over it put a dead connection back in openedDevices,
+                        // and every unlock through it failed with result == -1.
+                        if (!rawInUse) rawDevice.close()
+                    } else if (!stillUnmounting && !otherMounted && !candidatesInForm &&
+                            !OtgMasterState.holdConnections) {
+                        // Last partition from this USB — release the connection.
+                        //
+                        // This used to close only if openedDevices still held it, but a
+                        // successful mount of the last encrypted partition removes the
+                        // entry, so the connection was never closed: every remount leaked
+                        // one, still holding the interface, while the next probe opened
+                        // another to the same device.
+                        openedDevices.remove(sourceKey)
+                        if (!rawInUse) rawDevice.close()
+                    } else if (!drive.isPlain && volCandidate != null) {
+                        // Other partitions still alive; restore this candidate so the user can remount.
+                        openedDevices[sourceKey] = rawDevice
+                        val existing = _deviceCandidates.value.find { it.deviceName == sourceKey }
+                        if (existing != null) {
+                            _deviceCandidates.value = _deviceCandidates.value.map {
+                                if (it.deviceName == sourceKey &&
+                                        it.candidates.none { c -> c.startBlock == volCandidate.startBlock })
+                                    it.copy(candidates = (it.candidates + volCandidate).sortedBy { c -> c.startBlock })
+                                else it
+                            }
+                        } else {
+                            _deviceCandidates.value = _deviceCandidates.value + UsbDeviceCandidate(
+                                deviceName = sourceKey,
+                                displayName = drive.sourceDeviceDisplayName ?: sourceKey,
+                                blockDevice = rawDevice,
+                                candidates = listOf(volCandidate),
+                                plainPartitions = emptyList()
+                            )
+                        }
+                    }
+                }
+
+                refreshDevices()
+            }
+          } finally {
+            OtgMasterState.unmountsInFlight.decrementAndGet()
+          }
+        }
+    }
+
+    // ── Format and Encrypt ────────────────────────────────────────────────────
+
+    /** The running or last Format/Encrypt, shown by DriveOperationDialog. */
+    private val driveOperation = mutableStateOf<app.fayaz.otgmaster.ui.DriveOperation?>(null)
+
+    /** Why Format is not offered for [drive], or null if it is. */
+    private fun formatUnavailable(drive: MountedDrive): String? = when {
+        drive.isReadOnly -> getString(R.string.action_unavailable_read_only)
+        drive.sourceVolumeCandidate?.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.BITLOCKER ->
+            getString(R.string.format_unavailable_fs, "BitLocker")
+        drive.filesystemName != "FAT32" && drive.filesystemName != "exFAT" ->
+            getString(R.string.format_unavailable_fs, drive.filesystemName)
+        drive.blockDevice == null -> getString(R.string.encrypt_unavailable_bounds)
+        else -> null
+    }
+
+    /** Why Encrypt is not offered for [drive], or null if it is. */
+    private fun encryptUnavailable(drive: MountedDrive): String? = when {
+        drive.isReadOnly -> getString(R.string.action_unavailable_read_only)
+        drive.partitionStartBlock == null || drive.partitionBlockCount == null || drive.rawBlockDevice == null ->
+            getString(R.string.encrypt_unavailable_bounds)
+        drive.rawBlockDevice.blockSize != 512 -> getString(R.string.encrypt_unavailable_sector)
+        else -> null
+    }
+
+    private fun driveSummary(drive: MountedDrive): app.fayaz.otgmaster.ui.DriveSummary {
+        val type = drive.sourceVolumeCandidate?.containerType
+        val bytes = (drive.partitionBlockCount ?: 0L) * (drive.rawBlockDevice?.blockSize ?: 512)
+        return app.fayaz.otgmaster.ui.DriveSummary(
+            deviceName = drive.sourceDeviceDisplayName ?: drive.name,
+            partitionLabel = drive.partitionLabel,
+            filesystem = drive.filesystemName,
+            container = if (type == null || drive.isPlain) "Not encrypted" else encryptionTag(type).first,
+            sizeText = if (bytes > 0) formatSize(bytes) else formatSize(drive.fileSystem.capacity),
+            serial = drive.sourceDeviceName?.split(":")?.getOrNull(2)?.takeIf { it.isNotBlank() },
+        )
+    }
+
+    /**
+     * Takes [drive] out of the mount list and unmounts its filesystem, leaving the block
+     * device it was mounted from — and so any container's key, and the USB connection —
+     * open for the caller to write through.
+     */
+    private suspend fun detachForErase(drive: MountedDrive) {
+        withContext(Dispatchers.Main) {
+            OtgMasterState.removeDrive(drive.id)
+            contentResolver.notifyChange(
+                android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null)
+            app.fayaz.otgmaster.extension.ExtensionContract.notifyCompanions(
+                applicationContext, app.fayaz.otgmaster.extension.ExtensionContract.ACTION_VOLUME_UNMOUNTED, drive)
+            updateMountedDrives()
+            removeDriveShortcut(drive.id)
+        }
+        // As in unmountDrive: let in-flight file callbacks finish before the filesystem goes.
+        app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.drainCallbacks()
+        deviceMutex.withLock {
+            when (val fs = drive.fileSystem) {
+                is app.fayaz.otgmaster.exfat.ExFatFileSystem -> fs.unmount()
+                is app.fayaz.otgmaster.ntfs.NtfsFileSystem -> fs.unmount()
+                is app.fayaz.otgmaster.apfs.ApfsFileSystem -> fs.unmount()
+            }
+        }
+    }
+
+    /**
+     * Puts [candidate], a partition of [drive]'s USB device, in the unlock form, keeping
+     * [raw] open for it: what unmountDrive does for an encrypted partition that is
+     * unmounted while others on the same drive stay up.
+     */
+    private fun offerForUnlock(drive: MountedDrive, raw: RawBlockDevice, candidate: VolumeCandidate) {
+        val sourceKey = drive.sourceDeviceName ?: return
+        openedDevices[sourceKey] = raw
+        val existing = _deviceCandidates.value.find { it.deviceName == sourceKey }
+        _deviceCandidates.value = if (existing != null) {
+            _deviceCandidates.value.map {
+                if (it.deviceName == sourceKey && it.candidates.none { c -> c.startBlock == candidate.startBlock })
+                    it.copy(candidates = (it.candidates + candidate).sortedBy { c -> c.startBlock })
+                else it
+            }
+        } else {
+            _deviceCandidates.value + UsbDeviceCandidate(
+                deviceName = sourceKey,
+                displayName = drive.sourceDeviceDisplayName ?: sourceKey,
+                blockDevice = raw,
+                candidates = listOf(candidate),
+                plainPartitions = emptyList(),
+            )
+        }
+    }
+
+    /** Mounts the filesystem now on [device] in [old]'s place, and lists it again. */
+    private suspend fun remountAfterErase(
+        old: MountedDrive,
+        device: RawBlockDevice,
+        filesystemName: String,
+        candidate: VolumeCandidate?,
+        plain: Boolean,
+    ): MountedDrive {
+        val byteDevice = me.jahnen.libaums.core.driver.ByteBlockDevice(
+            device as me.jahnen.libaums.core.driver.BlockDeviceDriver)
+        val fileSystem = FileSystemFactory.createFileSystem(PartitionTableEntry(0, 0, 0), byteDevice)
+        val displayName = old.sourceDeviceDisplayName ?: old.name
+        val drive = old.copy(
+            name = if (plain) getString(R.string.mounted_drive_name_plain, displayName, filesystemName, old.id)
+                   else getString(R.string.mounted_drive_name, displayName, old.id),
+            fileSystem = fileSystem,
+            blockDevice = device,
+            isPlain = plain,
+            sourceVolumeCandidate = candidate,
+            filesystemName = filesystemName,
+            mountedReadOnly = false,
+        )
+        OtgMasterState.addDrive(drive)
+        withContext(Dispatchers.Main) {
+            contentResolver.notifyChange(
+                android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null)
+            app.fayaz.otgmaster.extension.ExtensionContract.notifyCompanions(
+                applicationContext, app.fayaz.otgmaster.extension.ExtensionContract.ACTION_VOLUME_MOUNTED, drive)
+            newlyMountedDriveIds.value = newlyMountedDriveIds.value + drive.id
+            updateMountedDrives()
+            pushDriveShortcut(drive)
+        }
+        return drive
+    }
+
+    private fun progressFor(title: String) = app.fayaz.otgmaster.format.DriveFormatter.Progress { phase, fraction ->
+        driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, phase, fraction)
+    }
+
+    /**
+     * Format: an empty filesystem of the same kind, size, cluster size and label, written
+     * through the device the volume is mounted from, so a container stays as it is.
+     */
+    private fun formatDrive(drive: MountedDrive, req: app.fayaz.otgmaster.ui.FormatRequest) {
+        val full = req.full
+        val title = getString(R.string.operation_format_title, drive.partitionLabel.ifEmpty { drive.name })
+        val device = drive.blockDevice ?: return
+        driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, getString(R.string.operation_unmounting), null)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        appendLog(getString(R.string.log_format_started, drive.name, drive.filesystemName, if (full) "full" else "quick"))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            try {
+                val label = runCatching { drive.fileSystem.volumeLabel.trim() }.getOrDefault("")
+                // Read before anything is touched: a volume the formatter cannot lay out
+                // again is refused with its files intact.
+                val existing = deviceMutex.withLock {
+                    app.fayaz.otgmaster.format.DriveFormatter.readExisting(device, label)
+                }.copy(label = req.label)
+                val target = req.filesystem
+                detachForErase(drive)
+                deviceMutex.withLock {
+                    app.fayaz.otgmaster.format.DriveFormatter.reformat(device, existing, full, progressFor(title), target)
+                    (device as? app.fayaz.otgmaster.block.CachedBlockDevice)?.invalidate()
+                }
+                driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, getString(R.string.operation_mounting), null)
+                remountAfterErase(drive, device, target.displayName, drive.sourceVolumeCandidate, drive.isPlain)
+                val secs = ((System.currentTimeMillis() - t0) / 1000).toInt()
+                withContext(Dispatchers.Main) {
+                    appendLog(getString(R.string.log_format_done, drive.name, target.displayName, secs))
+                    driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title,
+                        getString(R.string.operation_format_done, target.displayName), 1f, finished = true)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("OTGMaster", "format failed", e)
+                withContext(Dispatchers.Main) {
+                    appendLog(getString(R.string.log_operation_failed, title, e.message ?: e.javaClass.simpleName))
+                    driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, "", null, finished = true,
+                        error = getString(R.string.operation_failed, e.message ?: e.javaClass.simpleName))
+                    refreshDevices()
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+        }
+    }
+
+    /**
+     * Encrypt: a new VeraCrypt volume over the whole partition, holding a new exFAT or
+     * FAT32, mounted in the old volume's place. Erases the partition.
+     */
+    private fun encryptDrive(drive: MountedDrive, req: app.fayaz.otgmaster.ui.EncryptRequest) {
+        val title = getString(R.string.operation_encrypt_title, drive.partitionLabel.ifEmpty { drive.name })
+        val raw = drive.rawBlockDevice ?: return
+        val start = drive.partitionStartBlock ?: return
+        val count = drive.partitionBlockCount ?: return
+        val deviceKey = drive.sourceDeviceName
+        driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, getString(R.string.operation_unmounting), null)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        appendLog(getString(R.string.log_encrypt_started, drive.name, req.cipher.displayName, req.hash.displayName,
+            req.filesystem.displayName, if (req.full) "full" else "quick"))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            try {
+                detachForErase(drive)
+                deviceMutex.withLock { drive.blockDevice?.close() }
+                // The whole partition, raw. Not closed with the volume: the USB connection
+                // under it belongs to openedDevices / unmountDrive, as for APFS.
+                val slice = app.fayaz.otgmaster.block.SlicedBlockDevice(raw, start, count)
+                val partition = object : RawBlockDevice by slice { override fun close() {} }
+                val volume = deviceMutex.withLock {
+                    app.fayaz.otgmaster.format.DriveFormatter.encrypt(partition, req.password, req.pim,
+                        req.cipher, req.hash, req.filesystem, req.label, req.full, progressFor(title),
+                        keyfiles = req.keyfiles.map { uri -> { contentResolver.openInputStream(uri) } })
+                }
+                // Any credentials saved for the old volume would now only fail.
+                if (deviceKey != null) {
+                    withContext(Dispatchers.Main) {
+                        credentialStore.deletePartition(deviceKey, start)
+                        sessionPlaintextCreds.remove(deviceKey)
+                    }
+                }
+                // Not mounted with the key still in memory. The new volume goes to the unlock
+                // form instead, so the user proves the password, PIM and keyfiles work while
+                // the drive is still empty, rather than after copying files onto it. Issue
+                // #94's reporter encrypted, used the drive, and found later that what they
+                // had kept would not open it.
+                volume.close() // wipes the master key; the USB connection stays open
+                val candidate = VolumeCandidate(drive.partitionLabel, start, count,
+                    app.fayaz.otgmaster.veracrypt.ContainerType.VERACRYPT)
+                val secs = ((System.currentTimeMillis() - t0) / 1000).toInt()
+                withContext(Dispatchers.Main) {
+                    offerForUnlock(drive, raw, candidate)
+                    appendLog(getString(R.string.log_encrypt_done, drive.name, secs))
+                    driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title,
+                        getString(R.string.operation_encrypt_done, req.cipher.displayName, req.hash.displayName,
+                            req.filesystem.displayName), 1f, finished = true)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("OTGMaster", "encrypt failed", e)
+                withContext(Dispatchers.Main) {
+                    appendLog(getString(R.string.log_operation_failed, title, e.message ?: e.javaClass.simpleName))
+                    driveOperation.value = app.fayaz.otgmaster.ui.DriveOperation(title, "", null, finished = true,
+                        error = getString(R.string.operation_failed, e.message ?: e.javaClass.simpleName))
+                    refreshDevices()
+                }
+            } finally {
+                req.password.fill('\u0000')
+                withContext(Dispatchers.Main) {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+        }
+    }
+
+    private fun detectPlainPartitions(device: RawBlockDevice, candidates: List<VolumeCandidate>): List<PlainPartition> {
+        return candidates.mapNotNull { candidate ->
+            // Encrypted APFS carries the same container superblock as plain APFS, so
+            // the signature alone would auto-mount it without its password.
+            if (candidate.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.APFS) return@mapNotNull null
+            val startBlock = candidate.startBlock
+            val available = device.blockCount - startBlock
+            if (available <= 0) return@mapNotNull null
+            val data = try {
+                device.readBlocks(startBlock, minOf(4, available).toInt())
+            } catch (_: Exception) { return@mapNotNull null }
+            val fs = FilesystemDetector.detectFromBytes(data)
+            if (fs is DetectedFilesystem.Supported) {
+                PlainPartition(
+                    label = candidate.label,
+                    startBlock = startBlock,
+                    blockCount = candidate.blockCount ?: available,
+                    filesystemName = fs.displayName
+                )
+            } else null
+        }
+    }
+
+    /**
+     * Plain partitions being mounted right now, as "deviceKey@startBlock".
+     *
+     * A mount is asynchronous and only lands in mountedDrives at the end, so "is it
+     * mounted?" alone let two callers mount the same partition. Samsung M30, drive D:
+     * the auto-mount on launch was still in flight when the benchmark's mount
+     * request asked for p2, and p2 ended up mounted twice — two independent ext4
+     * instances over one filesystem, one of which then took the write test.
+     */
+    private val plainMountsInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun mountPlainDevice(candidate: UsbDeviceCandidate, plain: PlainPartition) {
+        val mountKey = "${candidate.deviceName}@${plain.startBlock}"
+        val alreadyMounted = OtgMasterState.mountedDrives.any {
+            it.isPlain && it.sourceDeviceName == candidate.deviceName && it.partitionLabel == plain.label
+        }
+        if (alreadyMounted || !plainMountsInFlight.add(mountKey)) {
+            android.util.Log.i("OTGMaster", "mountPlainDevice: ${plain.label} already mounted or mounting, skipped")
+            return
+        }
+        val rawDevice = candidate.blockDevice
+        val sliced: RawBlockDevice = if (plain.startBlock == 0L) rawDevice
+            else app.fayaz.otgmaster.block.SlicedBlockDevice(rawDevice, plain.startBlock, plain.blockCount)
+        val adapter = app.fayaz.otgmaster.block.RawBlockDeviceAdapter(sliced)
+        val deviceDisplayName = candidate.displayName
+        appendLog("Mounting ${plain.filesystemName} on $deviceDisplayName…")
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val dummyEntry = PartitionTableEntry(0, 0, 0)
+                // Same cache for plain volumes: libaums rebuilds directory state that
+                // libexfat keeps parsed, so FAT32 re-reads blocks instead (its warm
+                // listing is 556 ms against exFAT's 30 ms).
+                val cachedDevice = wrapWithCache(adapter, plain.filesystemName)
+                val byteDevice = me.jahnen.libaums.core.driver.ByteBlockDevice(
+                    cachedDevice as me.jahnen.libaums.core.driver.BlockDeviceDriver
+                )
+                val fileSystem = FileSystemFactory.createFileSystem(dummyEntry, byteDevice)
+                val driveId = app.fayaz.otgmaster.extension.ExtensionContract.stableDriveId(
+                    candidate.deviceName, plain.startBlock, OtgMasterState.mountedDrives.map { it.id })
+                val mountedDrive = MountedDrive(
+                    id = driveId,
+                    name = getString(R.string.mounted_drive_name_plain, deviceDisplayName, plain.filesystemName, driveId),
+                    fileSystem = fileSystem,
+                    blockDevice = cachedDevice,
+                    sourceDeviceName = candidate.deviceName,
+                    sourceDeviceDisplayName = deviceDisplayName,
+                    isPlain = true,
+                    rawBlockDevice = rawDevice,
+                    partitionLabel = plain.label,
+                    filesystemName = plain.filesystemName,
+                    partitionStartBlock = plain.startBlock,
+                    partitionBlockCount = plain.blockCount,
+                )
+                OtgMasterState.addDrive(mountedDrive)
+                mountedDrive.readOnlyReason?.let { reason ->
+                    withContext(Dispatchers.Main) { appendLog("${mountedDrive.name} is read-only: $reason") }
+                }
+                contentResolver.notifyChange(
+                    android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null
+                )
+                app.fayaz.otgmaster.extension.ExtensionContract.notifyCompanions(
+                    applicationContext, app.fayaz.otgmaster.extension.ExtensionContract.ACTION_VOLUME_MOUNTED, mountedDrive)
+                withContext(Dispatchers.Main) {
+                    newlyMountedDriveIds.value = newlyMountedDriveIds.value + driveId
+                    pendingToastMountNames.add(deviceDisplayName)
+                    toastMountHandler.removeCallbacks(toastMountRunnable)
+                    toastMountHandler.postDelayed(toastMountRunnable, 300L)
+                    updateMountedDrives()
+                    pushDriveShortcut(mountedDrive)
+                    appendLog(getString(R.string.log_mounted_successfully, deviceDisplayName, fileSystem.capacity / (1024 * 1024)))
+                    // Don't remove from openedDevices here — for mixed devices (plain + encrypted
+                    // partitions), the encrypted partitions still need the USB connection.
+                    // Cleanup is handled by attemptUnlock when the last encrypted partition mounts,
+                    // or by the detach handler when the device is unplugged.
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    toastState.value = Pair("Mount failed: ${e.message ?: "Unknown error"}", false)
+                    appendLog("Failed to mount ${candidate.displayName}: ${e.reason()}")
+                }
+            } finally {
+                // Only after addDrive (or the failure): from then on mountedDrives answers.
+                plainMountsInFlight.remove(mountKey)
+            }
+        }
+    }
+
+    /**
+     * Cache line size for a filesystem.
+     *
+     * exFAT re-reads a small metadata region thousands of times, so a 64 KiB line
+     * is nearly free and pays back 90x on a cold directory listing. FAT32 at small
+     * cluster sizes walks a large FAT sparsely, where the same readahead was pure
+     * amplification and made cold listings 2-4x slower. Measured in
+     * docs/IO_PERFORMANCE.md.
+     */
+    /**
+     * Wraps [device] in the block cache unless configuration disables it.
+     *
+     * Returning the bare device when disabled lets the cache be A/B'd in one
+     * session; [device] already implements BlockDeviceDriver in both mount paths.
+     */
+    private fun wrapWithCache(
+        device: app.fayaz.otgmaster.block.RawBlockDevice,
+        filesystemName: String,
+    ): app.fayaz.otgmaster.block.RawBlockDevice {
+        val cfg = OtgMasterState.cacheConfig
+        if (cfg?.enabled == false) {
+            appendLog("Block cache: DISABLED for this mount")
+            android.util.Log.i("OTGMaster", "block cache disabled for this mount")
+            return device
+        }
+        val readAhead = cfg?.readAheadBytes ?: readAheadFor(filesystemName)
+        android.util.Log.i("OTGMaster", "block cache enabled, readahead $readAhead bytes")
+        return app.fayaz.otgmaster.block.CachedBlockDevice(device, readAheadBytes = readAhead)
+    }
+
+    private fun readAheadFor(filesystemName: String): Int = when {
+        filesystemName.contains("exFAT", ignoreCase = true) ->
+            app.fayaz.otgmaster.block.CachedBlockDevice.DEFAULT_READAHEAD_BYTES
+        filesystemName.startsWith("ext", ignoreCase = true) ->
+            app.fayaz.otgmaster.block.CachedBlockDevice.DEFAULT_READAHEAD_BYTES
+        else ->
+            app.fayaz.otgmaster.block.CachedBlockDevice.FAT_READAHEAD_BYTES
+    }
+
+    /**
+     * Unlocks and mounts every probed candidate with one set of credentials.
+     *
+     * Backs [OtgMasterState.MountRequest]. Goes through the same attemptUnlock the
+     * form uses, so it exercises the real path rather than a parallel one.
+     */
+    /**
+     * Re-probes drives the app still holds a connection to but lists nothing for —
+     * what [OtgMasterState.holdConnections] leaves after unmounting everything — so a
+     * mount request can bring them back without releasing and reopening the stick.
+     * Probes through the held connection, under deviceMutex, like
+     * reofferPartlyMountedDevices.
+     */
+    private suspend fun reprobeHeldDevices() {
+        // A listed device can still be missing its plain partitions: unmounting an
+        // encrypted partition puts it back on the list as a new entry with no plain
+        // ones, so after the benchmark's unmount-everything the request remounted
+        // Drive 1's encrypted partitions and none of its seven plain ones.
+        val listedWithPlain = _deviceCandidates.value.filter { it.plainPartitions.isNotEmpty() }
+            .map { it.deviceName }.toSet()
+        val mounted = OtgMasterState.mountedDrives.mapNotNull { it.sourceDeviceName }.toSet()
+        val held = openedDevices.filterKeys { it !in listedWithPlain && it !in mounted }
+        for ((key, raw) in held) {
+            val probed = withContext(Dispatchers.IO) {
+                runCatching {
+                    deviceMutex.withLock {
+                        val all = app.fayaz.otgmaster.veracrypt.VeraCryptUnlocker().probeCandidates(raw)
+                        all to detectPlainPartitions(raw, all)
+                    }
+                }.onFailure { android.util.Log.w(TAG, "re-probe of held $key failed", it) }.getOrNull()
+            } ?: continue
+            val (all, plain) = probed
+            val plainStarts = plain.map { it.startBlock }.toSet()
+            val locked = all.filter {
+                it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNKNOWN &&
+                    it.containerType != app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED &&
+                    it.startBlock !in plainStarts
+            }
+            android.util.Log.i("OTGMaster", "re-probed held $key: ${locked.size} locked, ${plain.size} plain")
+            val existing = _deviceCandidates.value.find { it.deviceName == key }
+            _deviceCandidates.value = if (existing != null) {
+                // Keep its locked candidates (unmountDrive restored them); add the plain ones.
+                _deviceCandidates.value.map { if (it.deviceName == key) it.copy(plainPartitions = plain) else it }
+            } else {
+                _deviceCandidates.value + UsbDeviceCandidate(key, key, raw, locked, plain, all.size - locked.size - plain.size)
+            }
+        }
+    }
+
+    private fun mountProbedCandidates(
+        password: String,
+        pim: Int?,
+        cipherName: String,
+        hashName: String,
+        readOnly: Boolean? = null,
+    ) {
+        val cipher = app.fayaz.otgmaster.veracrypt.VeraCryptCipher.entries
+            .find { it.name == cipherName || it.displayName == cipherName }
+            ?: app.fayaz.otgmaster.veracrypt.VeraCryptCipher.DEFAULT
+        val hash = app.fayaz.otgmaster.veracrypt.VeraCryptHash.entries
+            .find { it.name == hashName || it.displayName == hashName }
+            ?: app.fayaz.otgmaster.veracrypt.VeraCryptHash.DEFAULT
+
+        val devices = _deviceCandidates.value
+        if (devices.isEmpty()) {
+            val msg = "Mount request: no probed candidates — is a drive attached and permitted?"
+            appendLog(msg)
+            android.util.Log.w("OTGMaster", msg)
+            return
+        }
+        val total = devices.sumOf { it.candidates.size }
+        val msg = "Mount request: $total candidate(s), ${cipher.displayName}/${hash.displayName}, PIM ${pim ?: "default"}"
+        appendLog(msg)
+        android.util.Log.i("OTGMaster", msg)
+        devices.forEach { device ->
+            android.util.Log.i("OTGMaster",
+                "Mount request: ${device.deviceName} holds ${objId(device.blockDevice)}," +
+                " candidates @${device.candidates.map { it.startBlock }}")
+            // Plain partitions too. The programmatic request means "mount this drive",
+            // and after an unmount a plain partition only came back through a
+            // re-probe — which does not happen while an encrypted candidate on the
+            // same device holds its connection. Huawei P20 Lite, drive D: the
+            // benchmark's startup unmount took down the auto-mounted p2 and the run
+            // measured p1 alone.
+            val mountedPlain = OtgMasterState.mountedDrives
+                .filter { it.isPlain && it.sourceDeviceName == device.deviceName }
+                .map { it.partitionLabel }.toSet()
+            device.plainPartitions.filter { it.label !in mountedPlain }.forEach { plain ->
+                android.util.Log.i("OTGMaster", "Mount request: remounting plain ${plain.label}")
+                mountPlainDevice(device, plain)
+            }
+            device.candidates.forEach { candidate ->
+                OtgMasterState.unlocksInFlight.incrementAndGet()
+                attemptUnlock(
+                    device.deviceName, candidate, password, pim,
+                    emptyList(), cipher, hash, readOnlyOverride = readOnly,
+                ) { OtgMasterState.unlocksInFlight.decrementAndGet() }
+            }
+        }
+    }
+
+    /** Drives whose repair dialog has been shown once since they mounted. */
+    private val journalRepairOffered = mutableSetOf<String>()
+
+    /**
+     * Opens the repair dialog, once, for a drive that mounted with its ext4 journal
+     * unreplayed. Called from [updateMountedDrives], which every mount path reaches:
+     * hooking the mount paths themselves missed the whole-device one.
+     */
+    private fun offerJournalRepair(drives: List<MountedDrive>) {
+        journalRepairOffered.retainAll(drives.map { it.id }.toSet())
+        if (journalRepairPrompt.value != null) return
+        drives.firstOrNull {
+            it.id !in journalRepairOffered &&
+                (it.fileSystem as? app.fayaz.otgmaster.ext4.Ext4FileSystem)?.needsJournalRecovery == true
+        }?.let {
+            journalRepairOffered += it.id
+            journalRepairPrompt.value = it.id
+        }
+    }
+
+    /**
+     * Replays [drive]'s ext4 journal, after which it takes writes. Device work is
+     * serialised with mounts and unmounts, which share the USB connection.
+     */
+    private fun repairJournal(drive: MountedDrive) {
+        journalRepairPrompt.value = null
+        val fs = drive.fileSystem as? app.fayaz.otgmaster.ext4.Ext4FileSystem ?: return
+        appendLog(getString(R.string.log_journal_repair_started, drive.name))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = runCatching { deviceMutex.withLock { fs.replayJournal() } }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { r ->
+                    appendLog(getString(R.string.log_journal_repaired, drive.name, r.transactions, r.blocksReplayed))
+                    toastState.value = Pair(getString(R.string.toast_journal_repaired), true)
+                }.onFailure { e ->
+                    android.util.Log.e("OTGMaster", "journal repair failed", e)
+                    appendLog(getString(R.string.log_journal_repair_failed, drive.name, e.message ?: e.javaClass.simpleName))
+                    toastState.value = Pair(getString(R.string.toast_journal_repair_failed), false)
+                }
+                journalRepairs.intValue++
+                updateMountedDrives()
+                // The provider's root loses or gains FLAG_SUPPORTS_CREATE with it.
+                contentResolver.notifyChange(
+                    android.provider.DocumentsContract.buildRootsUri("app.fayaz.otgmaster.documents"), null
+                )
+            }
+        }
+    }
+
+    private fun updateMountedDrives() {
+        mountedDrivesState.value = OtgMasterState.mountedDrives.toList()
+        OtgMasterState.clearDisconnectedFor(mountedDrivesState.value)
+        offerJournalRepair(mountedDrivesState.value)
+    }
+
+    private fun openFilesApp(drive: MountedDrive) {
+        val authority = app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.AUTHORITY
+        val rootId = app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.rootIdForDrive(drive.id)
+        // BROWSE with a root URI (content://authority/root/rootId) tells DocumentsUI to open
+        // directly at that root rather than its default Downloads location. A document URI
+        // doesn't pass the isRootUri() check in FilesActivity and falls back to Downloads.
+        val rootUri = Uri.parse("content://$authority/root/$rootId")
+        val candidates = listOf(
+            Intent("android.provider.action.BROWSE").apply {
+                data = rootUri
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            },
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(rootUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            }
+        )
+        for (intent in candidates) {
+            try {
+                startActivity(intent)
+                return
+            } catch (_: Exception) {}
+        }
+        appendLog(getString(R.string.log_could_not_open_files_app, "no handler found"))
+    }
+
+
+
+    /** Returns which of [candidates] would actually trigger auto-mount right now. */
+    private fun deferCandidates(devices: List<UsbDeviceCandidate>) {
+        devices.forEach { deferredCandidates[it.deviceName] = it }
+    }
+
+    /** Puts back anything withheld for an auto-mount prompt. Safe to call repeatedly. */
+    private fun restoreDeferredCandidates() {
+        if (deferredCandidates.isEmpty()) return
+        val shown = _deviceCandidates.value.map { it.deviceName }.toSet()
+        // Already-mounted *partitions*, not devices. deviceName identifies the
+        // physical drive, so testing it against mountedDrives threw away every
+        // still-locked partition on a drive that had any partition mounted. On
+        // drive D — plain ext4 on p2, VeraCrypt on p1 — auto-mounting p2 made p1
+        // unreachable: cancelling the biometric prompt left the form saying "No
+        // USB drives available to mount" with the drive plugged in.
+        val mountedPartitions = OtgMasterState.mountedDrives.mapNotNull { drive ->
+            val start = drive.sourceVolumeCandidate?.startBlock ?: return@mapNotNull null
+            drive.sourceDeviceName?.let { it to start }
+        }.toSet()
+        val toRestore = deferredCandidates.values.mapNotNull { device ->
+            if (device.deviceName in shown) return@mapNotNull null
+            val remaining = device.candidates.filter {
+                (device.deviceName to it.startBlock) !in mountedPartitions
+            }
+            if (remaining.isEmpty()) null else device.copy(candidates = remaining)
+        }
+        deferredCandidates.clear()
+        if (toRestore.isNotEmpty()) {
+            _deviceCandidates.value = _deviceCandidates.value + toRestore
+        }
+    }
+
+    private fun filterAutoMountCandidates(candidates: List<UsbDeviceCandidate>): List<UsbDeviceCandidate> {
+        if (!autoMountEnabled.value) return emptyList()
+        val excluded = excludedDeviceKeys.value
+        return candidates.filter {
+            it.deviceName !in autoMountAttempted &&
+            it.deviceName !in manuallyUnmountedDevices &&
+            it.deviceName !in sessionPlaintextCreds &&
+            it.candidates.any { c -> credentialStore.load(it.deviceName, c.startBlock) != null } &&
+            it.deviceName !in excluded
+        }
+    }
+
+    private fun triggerAutoMount(newCandidates: List<UsbDeviceCandidate>) {
+        val toMount = filterAutoMountCandidates(newCandidates)
+        if (toMount.isEmpty()) return
+        toMount.forEach { autoMountAttempted.add(it.deviceName) }
+        // Debounce: accumulate hub devices that arrive in rapid succession, then
+        // fire one combined biometric prompt for all of them after a short delay.
+        pendingAutoMountDevices.addAll(toMount)
+        autoMountDebounceHandler.removeCallbacks(autoMountDebounceRunnable)
+        autoMountDebounceHandler.postDelayed(autoMountDebounceRunnable, 400L)
+    }
+
+    private fun showAutoMountPrompt(devices: List<UsbDeviceCandidate>) {
+        if (isAutoMountPromptShowing) {
+            // A prompt is already up for another device; do not strand these.
+            restoreDeferredCandidates()
+            return
+        }
+        isAutoMountPromptShowing = true
+        val executor = androidx.core.content.ContextCompat.getMainExecutor(this)
+        val callback = object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
+                isAutoMountPromptShowing = false
+                // Restore so attemptUnlock can look up displayName, and the form shows any
+                // remaining candidates while each partition mounts in the background.
+                restoreDeferredCandidates()
+                devices.forEach { device ->
+                    val allCreds = credentialStore.loadAll(device.deviceName)
+                    if (allCreds.isEmpty()) return@forEach
+                    device.candidates.forEach { candidate ->
+                        val creds = allCreds.find { it.candidateStartBlock == candidate.startBlock }
+                            ?: return@forEach
+                        sessionPlaintextCreds[device.deviceName] = creds
+                        val cipher = app.fayaz.otgmaster.veracrypt.VeraCryptCipher.entries
+                            .find { it.name == creds.cipherName }
+                            ?: app.fayaz.otgmaster.veracrypt.VeraCryptCipher.DEFAULT
+                        val hash = app.fayaz.otgmaster.veracrypt.VeraCryptHash.entries
+                            .find { it.name == creds.hashName }
+                            ?: app.fayaz.otgmaster.veracrypt.VeraCryptHash.DEFAULT
+                        // Auto mount follows Settings → Read-only mode, not a choice made
+                        // for this partition in the form: there is no form here to show it.
+                        attemptUnlock(device.deviceName, candidate, creds.password, creds.pim.toIntOrNull(), creds.keyfileUris, cipher, hash,
+                            fromCache = true, readOnlyOverride = readOnlyDefault.value) {}
+                    }
+                }
+            }
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                isAutoMountPromptShowing = false
+                // Restore so the user can fall back to manual unlock after dismissing or
+                // cancelling the prompt.
+                restoreDeferredCandidates()
+            }
+            override fun onAuthenticationFailed() {}
+        }
+        val prompt = androidx.biometric.BiometricPrompt(this, executor, callback)
+        val subtitle = if (devices.size == 1)
+            getString(R.string.auto_mount_prompt_subtitle_single, devices[0].displayName)
+        else
+            getString(R.string.auto_mount_prompt_subtitle_multi, devices.size)
+        val builder = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
+            .setTitle(getString(R.string.auto_mount_prompt_title))
+            .setSubtitle(subtitle)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setAllowedAuthenticators(
+                androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            )
+        } else {
+            builder.setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .setNegativeButtonText(getString(R.string.auto_mount_prompt_negative))
+        }
+        prompt.authenticate(builder.build())
+    }
+
+    private fun showQuickUnlockPrompt(deviceName: String, candidate: VolumeCandidate, onComplete: () -> Unit) {
+        val creds = sessionPlaintextCreds[deviceName]?.takeIf { it.candidateStartBlock == candidate.startBlock }
+            ?: credentialStore.load(deviceName, candidate.startBlock)
+            ?: run {
+            appendLog("No credentials found for $deviceName partition ${candidate.startBlock}")
+            onComplete()
+            return
+        }
+        val cipher = app.fayaz.otgmaster.veracrypt.VeraCryptCipher.entries
+            .find { it.name == creds.cipherName } ?: app.fayaz.otgmaster.veracrypt.VeraCryptCipher.DEFAULT
+        val hash = app.fayaz.otgmaster.veracrypt.VeraCryptHash.entries
+            .find { it.name == creds.hashName } ?: app.fayaz.otgmaster.veracrypt.VeraCryptHash.DEFAULT
+
+        val executor = androidx.core.content.ContextCompat.getMainExecutor(this)
+        val callback = object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
+                attemptUnlock(deviceName, candidate, creds.password, creds.pim.toIntOrNull(),
+                    creds.keyfileUris, cipher, hash, fromCache = true, onComplete = onComplete)
+            }
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) { onComplete() }
+            override fun onAuthenticationFailed() {}
+        }
+        val prompt = androidx.biometric.BiometricPrompt(this, executor, callback)
+        val displayName = _deviceCandidates.value.find { it.deviceName == deviceName }?.displayName ?: deviceName
+        val builder = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
+            .setTitle(getString(R.string.auto_mount_prompt_title))
+            .setSubtitle(displayName)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setAllowedAuthenticators(
+                androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            )
+        } else {
+            builder.setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .setNegativeButtonText(getString(R.string.auto_mount_prompt_negative))
+        }
+        prompt.authenticate(builder.build())
+    }
+
+    private fun clearLogs() {
+        logsState.clear()
+        OtgMasterState.clearLogHistory()
+    }
+
+    private fun copyText(text: String, label: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText(label, text)
+        clipboard.setPrimaryClip(clip)
+        appendLog(getString(R.string.log_copied_to_clipboard, label))
+    }
+
+    private fun appendLog(line: String) {
+        OtgMasterState.appendFolded(logsState, line, OtgMasterState.MAX_LOG_LINES)
+        // Mirrored into process-wide state so FeedbackActivity can show the same lines.
+        OtgMasterState.recordLog(line)
+    }
+
+    private fun handleShareIntent(intent: Intent) {
+        val uris: List<Uri> = when (intent.action) {
+            Intent.ACTION_SEND ->
+                listOfNotNull(intent.getParcelableExtraCompat<Uri>(Intent.EXTRA_STREAM))
+            Intent.ACTION_SEND_MULTIPLE -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                } ?: emptyList()
+            }
+            else -> return
+        }
+        if (uris.isEmpty()) return
+
+        if (OtgMasterState.mountedDrives.isEmpty()) {
+            toastState.value = Pair("No drives mounted. Mount a drive first.", false)
+            return
+        }
+
+        pendingShareUris = uris
+        // Use the same /root/ URI format that openFilesApp uses successfully — this passes
+        // DocumentsUI's isRootUri() check and opens the picker at our drive root directly.
+        // If a specific drive was tapped via a sharing shortcut use that drive's root;
+        // otherwise use the first mounted drive (single drive = no ambiguity).
+        val driveId = intent.getStringExtra(EXTRA_DRIVE_ID)
+            ?: OtgMasterState.mountedDrives.firstOrNull()?.id
+        val initialUri = driveId?.let { id ->
+            val rootId = app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.rootIdForDrive(id)
+            Uri.parse("content://${app.fayaz.otgmaster.provider.VeraCryptDocumentProvider.AUTHORITY}/root/$rootId")
+        }
+        openDocumentTreeLauncher.launch(initialUri)
+    }
+
+
+
+    private fun copyFilesToTree(sourceUris: List<Uri>, treeUri: Uri) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            var successCount = 0
+            var errorMsg: String? = null
+            try {
+                val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+                val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+                for (sourceUri in sourceUris) {
+                    val fileName = getFileNameFromUri(sourceUri) ?: "file_${System.currentTimeMillis()}"
+                    val mimeType = contentResolver.getType(sourceUri) ?: "*/*"
+                    val destDoc = DocumentsContract.createDocument(contentResolver, parentDocUri, mimeType, fileName)
+                    if (destDoc != null) {
+                        contentResolver.openInputStream(sourceUri)?.use { input ->
+                            contentResolver.openOutputStream(destDoc)?.use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        successCount++
+                    }
+                }
+            } catch (e: Exception) {
+                errorMsg = e.message
+                OtgMasterState.logFailure("share", "Copying shared files to the drive failed", e)
+            }
+            withContext(Dispatchers.Main) {
+                toastState.value = if (errorMsg != null) {
+                    Pair(getString(R.string.share_save_failed, errorMsg), false)
+                } else if (successCount == 1) {
+                    Pair(getString(R.string.share_saved, getFileNameFromUri(sourceUris[0]) ?: "file"), true)
+                } else {
+                    Pair(getString(R.string.share_saved_multiple, successCount), true)
+                }
+            }
+        }
+    }
+
+    private fun getFileNameFromUri(uri: Uri): String? {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx != -1) return cursor.getString(idx)
+            }
+        }
+        return uri.lastPathSegment
+    }
+
+    private fun pushDriveShortcut(drive: MountedDrive) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val shortcutManager = getSystemService(android.content.pm.ShortcutManager::class.java) ?: return
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_DEFAULT
+            putExtra(EXTRA_DRIVE_ID, drive.id)
+        }
+        val shortcut = android.content.pm.ShortcutInfo.Builder(this, "drive_share_${drive.id}")
+            .setShortLabel(drive.name)
+            .setLongLabel(drive.name)
+            .setIcon(android.graphics.drawable.Icon.createWithResource(this, R.mipmap.ic_launcher))
+            .setIntent(intent)
+            .setCategories(setOf(SHARE_TARGET_CATEGORY))
+            .setLongLived(true)
+            .build()
+        // Best-effort: a share shortcut is a convenience, and failing to add one must
+        // not fail the mount it follows. On Android 10 addDynamicShortcuts throws
+        // "Max number of dynamic shortcuts exceeded" from about the fifth mounted
+        // drive (pushDynamicShortcut, from Android 11, evicts instead). Thrown inside
+        // attemptUnlock's success path, that reported a mounted drive as failed,
+        // deleted its saved password, and ran onComplete twice (Samsung M30).
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                shortcutManager.pushDynamicShortcut(shortcut)
+            } else {
+                // Make room by dropping shortcuts of drives no longer mounted first.
+                val live = OtgMasterState.mountedDrives.map { "drive_share_${it.id}" }.toSet()
+                val stale = shortcutManager.dynamicShortcuts.map { it.id }.filter { it !in live }
+                if (stale.isNotEmpty()) shortcutManager.removeDynamicShortcuts(stale)
+                if (shortcutManager.dynamicShortcuts.size < shortcutManager.maxShortcutCountPerActivity)
+                    shortcutManager.addDynamicShortcuts(listOf(shortcut))
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("OTGMaster", "share shortcut for ${drive.name} not added: ${e.message}")
+        }
+    }
+
+    private fun removeDriveShortcut(driveId: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val shortcutManager = getSystemService(android.content.pm.ShortcutManager::class.java) ?: return
+        shortcutManager.removeDynamicShortcuts(listOf("drive_share_$driveId"))
+    }
+
+    private inline fun <reified T> Intent.getParcelableExtraCompat(name: String): T? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableExtra(name, T::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            getParcelableExtra(name)
+        }
+    }
+
+
+}
+
+/** Tag text and colour for a container type, shared by the drive cards and the volume picker. */
+fun encryptionTag(type: app.fayaz.otgmaster.veracrypt.ContainerType?): Pair<String, Color> =
+    when (type) {
+        app.fayaz.otgmaster.veracrypt.ContainerType.VERACRYPT -> Pair("VERACRYPT", Color(0xFF3949AB))
+        app.fayaz.otgmaster.veracrypt.ContainerType.LUKS1     -> Pair("LUKS1",     Color(0xFFE65100))
+        app.fayaz.otgmaster.veracrypt.ContainerType.LUKS2     -> Pair("LUKS2",     Color(0xFF6A1B9A))
+        app.fayaz.otgmaster.veracrypt.ContainerType.BITLOCKER -> Pair("BITLOCKER", Color(0xFF00838F))
+        app.fayaz.otgmaster.veracrypt.ContainerType.APFS      -> Pair("APFS",      Color(0xFF455A64))
+        // "could not tell" is not the same claim as "it is not encrypted", and the
+        // old catch-all else asserted the latter for both.
+        app.fayaz.otgmaster.veracrypt.ContainerType.UNKNOWN   -> Pair("UNKNOWN",   Color(0xFF757575))
+        // null is a plain-mounted drive card, which has no candidate behind it.
+        app.fayaz.otgmaster.veracrypt.ContainerType.UNENCRYPTED, null ->
+            Pair("UNENCRYPTED", Color(0xFF546E7A))
+    }
+
+@Composable
+fun DriveTag(label: String, color: Color) {
+    Surface(
+        shape = RoundedCornerShape(4.dp),
+        color = color,
+        contentColor = Color.White,
+    ) {
+        androidx.compose.foundation.layout.Box(modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)) {
+            Text(text = label, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+/** The card header: the USB device's name, then the partition. */
+fun driveTitle(drive: MountedDrive): String = buildString {
+    append(drive.sourceDeviceDisplayName ?: drive.name)
+    if (drive.partitionLabel.isNotEmpty()) {
+        append(" · ")
+        append(drive.partitionLabel)
+    }
+}
+
+fun formatSize(bytes: Long): String {
+    if (bytes <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
+    return String.format("%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+}
+
+/**
+ * The label Format and Encrypt start with: the volume's own, else the partition's name when
+ * it is a real one rather than the "Partition N" this app makes up, else OTGMASTER. Cut to
+ * the 11 characters both filesystems allow; the formatter upper-cases it for FAT32.
+ */
+/** How often a mounted drive's card re-reads its capacity and free space. */
+private const val SPACE_REFRESH_MS = 3_000L
+
+internal fun suggestedVolumeLabel(drive: MountedDrive): String {
+    val own = runCatching { drive.fileSystem.volumeLabel.trim() }.getOrDefault("")
+    val partition = drive.partitionLabel.trim().takeUnless { it.matches(Regex("(?i)partition \\d+")) }.orEmpty()
+    return own.ifEmpty { partition }.filter { it.code in 0x20..0x7E && it !in "\"*+,./:;<=>?[\\]|" }
+        .trim().take(11).ifEmpty { "OTGMASTER" }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
+@Composable
+fun OtgMasterApp(
+    deviceCandidates: List<UsbDeviceCandidate>,
+    mountedDrives: List<MountedDrive>,
+    logs: List<String>,
+    themeMode: ThemeMode,
+    versionName: String,
+    versionCode: Long,
+    formResetKey: Int,
+    autoMountEnabled: Boolean,
+    sessionCredentials: Map<String, app.fayaz.otgmaster.security.CredentialStore.Credentials>,
+    hasCachedCreds: (String, Long?) -> Boolean,
+    isExcluded: (String) -> Boolean,
+    readOnlyDefault: Boolean,
+    onReadOnlyDefaultChange: (Boolean) -> Unit,
+    isPartitionReadOnly: (String, Long) -> Boolean,
+    onSetPartitionReadOnly: (String, Long, Boolean) -> Unit,
+    onRefreshDevices: () -> Unit,
+    showNoDriveHelp: Boolean = false,
+    onUnlock: (String, VolumeCandidate, String, Int?, List<Uri>, app.fayaz.otgmaster.veracrypt.VeraCryptCipher, app.fayaz.otgmaster.veracrypt.VeraCryptHash, () -> Unit) -> Unit,
+    onUnmount: (MountedDrive) -> Unit,
+    onOpenFilesApp: (MountedDrive) -> Unit,
+    journalRepairPrompt: String? = null,
+    journalRepairs: Int = 0,
+    onRequestJournalRepair: (MountedDrive) -> Unit = {},
+    onJournalRepair: (MountedDrive) -> Unit = {},
+    onJournalRepairDismiss: () -> Unit = {},
+    onClearLogs: () -> Unit,
+    onCopyText: (String, String) -> Unit,
+    onThemeChange: (ThemeMode) -> Unit,
+    onAutoMountEnabledChange: (Boolean) -> Unit,
+    onClearAllCredentials: () -> Unit,
+    onClearDeviceCreds: (String) -> Unit = {},
+    onSetExcluded: (String, Boolean) -> Unit,
+    onQuickUnlock: (String, VolumeCandidate, () -> Unit) -> Unit = { _, _, cb -> cb() },
+    toastMessage: String? = null,
+    toastIsSuccess: Boolean = true,
+    onToastDismiss: () -> Unit = {},
+    newlyMountedDriveIds: Set<String> = emptySet(),
+    onHighlightConsumed: (String) -> Unit = {},
+    formatUnavailable: (MountedDrive) -> String? = { "" },
+    encryptUnavailable: (MountedDrive) -> String? = { "" },
+    driveSummary: (MountedDrive) -> app.fayaz.otgmaster.ui.DriveSummary? = { null },
+    onFormat: (MountedDrive, app.fayaz.otgmaster.ui.FormatRequest) -> Unit = { _, _ -> },
+    onEncrypt: (MountedDrive, app.fayaz.otgmaster.ui.EncryptRequest) -> Unit = { _, _ -> },
+    driveOperation: app.fayaz.otgmaster.ui.DriveOperation? = null,
+    onDriveOperationClose: () -> Unit = {},
+    disconnectedDrives: List<DisconnectedDrive> = emptyList(),
+    disconnectHistory: Map<String, List<DisconnectEvent>> = emptyMap(),
+    onDismissDisconnected: (String) -> Unit = {},
+) {
+    var showSettings by remember { mutableStateOf(false) }
+    var formatTarget by remember { mutableStateOf<MountedDrive?>(null) }
+    var encryptTarget by remember { mutableStateOf<MountedDrive?>(null) }
+    var backupTarget by remember { mutableStateOf<MountedDrive?>(null) }
+    var backupsTarget by remember { mutableStateOf<MountedDrive?>(null) }
+    var recoveryTarget by remember { mutableStateOf<MountedDrive?>(null) }
+    recoveryTarget?.let { d -> app.fayaz.otgmaster.ui.RecoveryDialog(d, onDismiss = { recoveryTarget = null }) }
+    val backupJobs by app.fayaz.otgmaster.backup.JobStore.get(androidx.compose.ui.platform.LocalContext.current).jobs.collectAsState()
+    backupTarget?.let { d ->
+        app.fayaz.otgmaster.ui.BackupSetupDialog(d.id, d.name, onDismiss = { backupTarget = null })
+    }
+    backupsTarget?.let { d ->
+        app.fayaz.otgmaster.ui.BackupJobsDialog(d.id, onDismiss = { backupsTarget = null })
+    }
+    // The volume label (and, for a drive without a partition table, its capacity) is read
+    // under the filesystem's lock, which a long write holds for minutes: read it off the main
+    // thread, once per form, and open the form when it is in.
+    val formatForm by produceState<Pair<app.fayaz.otgmaster.ui.DriveSummary, String>?>(null, formatTarget) {
+        value = formatTarget?.let { t -> withContext(Dispatchers.IO) { driveSummary(t)?.let { it to suggestedVolumeLabel(t) } } }
+    }
+    val encryptForm by produceState<Pair<app.fayaz.otgmaster.ui.DriveSummary, String>?>(null, encryptTarget) {
+        value = encryptTarget?.let { t -> withContext(Dispatchers.IO) { driveSummary(t)?.let { it to suggestedVolumeLabel(t) } } }
+    }
+    formatTarget?.let { target ->
+        formatForm?.let { (summary, suggestedLabel) ->
+            app.fayaz.otgmaster.ui.FormatScreen(
+                drive = summary,
+                current = app.fayaz.otgmaster.format.DriveFormatter.Filesystem.entries
+                    .firstOrNull { it.displayName.equals(target.filesystemName, ignoreCase = true) },
+                suggestedLabel = suggestedLabel,
+                insideContainer = !target.isPlain,
+                onConfirm = { req -> formatTarget = null; onFormat(target, req) },
+                onDismiss = { formatTarget = null },
+            )
+        }
+    }
+    encryptTarget?.let { target ->
+        encryptForm?.let { (summary, suggestedLabel) ->
+            app.fayaz.otgmaster.ui.EncryptScreen(
+                drive = summary,
+                suggestedLabel = suggestedLabel,
+                onConfirm = { req -> encryptTarget = null; onEncrypt(target, req) },
+                onDismiss = { encryptTarget = null },
+            )
+        }
+    }
+    driveOperation?.let { app.fayaz.otgmaster.ui.DriveOperationDialog(it, onDriveOperationClose) }
+    journalRepairPrompt?.let { id -> mountedDrives.firstOrNull { it.id == id } }?.let { target ->
+        app.fayaz.otgmaster.ui.JournalRepairDialog(
+            driveTitle = driveTitle(target),
+            onRepair = { onJournalRepair(target) },
+            onDismiss = onJournalRepairDismiss,
+        )
+    }
+    var isVeraCryptExpanded by remember { mutableStateOf(true) }
+    val scrollState = rememberScrollState()
+    val mountedScrollState = rememberScrollState()
+    var previousMountedCount by remember { mutableIntStateOf(mountedDrives.size) }
+
+    LaunchedEffect(mountedDrives.size) {
+        if (mountedDrives.size > previousMountedCount) {
+            scrollState.animateScrollTo(0)
+            mountedScrollState.animateScrollTo(0)
+        }
+        previousMountedCount = mountedDrives.size
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.app_name)) },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.cd_settings))
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        // Sections, laid out below as one column or, on a wide window, two panes.
+        val scanButton: @Composable () -> Unit = {
+            Button(
+                onClick = onRefreshDevices,
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "scan_button" }
+            ) {
+                Text(stringResource(R.string.scan_usb_devices))
+            }
+        }
+        val mountedSection: @Composable (alwaysShowTitle: Boolean) -> Unit = { alwaysShowTitle ->
+            if (mountedDrives.isNotEmpty() || disconnectedDrives.isNotEmpty() || alwaysShowTitle) {
+                Text(stringResource(R.string.mounted_devices), style = MaterialTheme.typography.titleLarge)
+            }
+            if (mountedDrives.isEmpty() && disconnectedDrives.isEmpty() && alwaysShowTitle) {
+                Text(stringResource(R.string.no_drives_mounted), style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+                mountedDrives.forEach { drive ->
+                    key(drive.id) {
+                    val highlightAlpha = remember { Animatable(0f) }
+                    val isNewlyMounted = drive.id in newlyMountedDriveIds
+                    LaunchedEffect(isNewlyMounted) {
+                        if (isNewlyMounted) {
+                            repeat(3) {
+                                highlightAlpha.animateTo(1f, tween(250))
+                                highlightAlpha.animateTo(0f, tween(250))
+                            }
+                            onHighlightConsumed(drive.id)
+                        }
+                    }
+                    val normalColor = MaterialTheme.colorScheme.secondaryContainer
+                    val cardColor = lerp(normalColor, Color(0xFF2E7D32), highlightAlpha.value * 0.6f)
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = cardColor)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            // Read off the main thread and refreshed, never while drawing: NTFS and
+                            // exFAT answer under the volume's lock, which a long write holds for
+                            // minutes, and ext4 reads its superblock from the drive. Read here, a
+                            // 2.2 GB write to an NTFS volume on a Pixel 7 Pro made the app "not
+                            // responding" at the first touch. Until the first read, no bar.
+                            val space by produceState<Pair<Long, Long>?>(null, drive.id) {
+                                while (true) {
+                                    value = withContext(Dispatchers.IO) {
+                                        runCatching { drive.fileSystem.capacity to drive.fileSystem.freeSpace }.getOrNull()
+                                    } ?: value
+                                    delay(SPACE_REFRESH_MS)
+                                }
+                            }
+
+                            Text(text = driveTitle(drive), style = MaterialTheme.typography.titleMedium)
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            // Encryption + filesystem tags
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                val encTag = encryptionTag(drive.sourceVolumeCandidate?.containerType)
+                                DriveTag(label = encTag.first, color = encTag.second)
+
+                                if (drive.filesystemName.isNotEmpty()) {
+                                    val fsColor = when {
+                                        drive.filesystemName.startsWith("ext", ignoreCase = true) -> Color(0xFF1565C0)
+                                        drive.filesystemName.equals("exFAT", ignoreCase = true)   -> Color(0xFF00796B)
+                                        drive.filesystemName.equals("FAT32", ignoreCase = true)   -> Color(0xFF2E7D32)
+                                        drive.filesystemName.equals("NTFS", ignoreCase = true)    -> Color(0xFF6A1B9A)
+                                        else -> Color(0xFF37474F)
+                                    }
+                                    DriveTag(label = drive.filesystemName.uppercase(), color = fsColor)
+                                }
+
+                                // Red, not a filesystem colour: it is a warning that the
+                                // drive refuses writes, and why is in the log.
+                                if (drive.isReadOnly) {
+                                    DriveTag(label = "READ-ONLY", color = Color(0xFFC62828))
+                                }
+                            }
+                            // journalRepairs is read so the card recomposes after a repair:
+                            // the volume changes underneath an unchanged MountedDrive.
+                            val needsRepair = remember(drive.id, journalRepairs) {
+                                (drive.fileSystem as? app.fayaz.otgmaster.ext4.Ext4FileSystem)?.needsJournalRecovery == true
+                            }
+                            if (needsRepair) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                app.fayaz.otgmaster.ui.JournalRepairNotice(onRepair = { onRequestJournalRepair(drive) })
+                            }
+
+                            space?.let { (totalSpace, freeSpace) ->
+                            val usedSpace = totalSpace - freeSpace
+                            val progress = if (totalSpace > 0) usedSpace.toFloat() / totalSpace.toFloat() else 0f
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(text = formatSize(totalSpace), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            LinearProgressIndicator(
+                                progress = progress,
+                                modifier = Modifier.fillMaxWidth().height(8.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.primaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(text = stringResource(R.string.used_label, formatSize(usedSpace)), style = MaterialTheme.typography.bodySmall)
+                                Text(text = stringResource(R.string.free_label, formatSize(freeSpace)), style = MaterialTheme.typography.bodySmall)
+                            }
+                            }
+                            disconnectHistory[drive.partitionKey]?.let { events ->
+                                Spacer(modifier = Modifier.height(8.dp))
+                                app.fayaz.otgmaster.ui.DisconnectHistory(events)
+                            }
+
+                            Spacer(modifier = Modifier.height(16.dp))
+                            val deviceKey = drive.sourceDeviceName
+                            // hasCachedCreds is keyed by device, not partition, so on a mixed
+                            // drive the unencrypted partition's card offered to clear the
+                            // *encrypted* partition's credentials.
+                            val canClearCredentials = !drive.isPlain && deviceKey != null && hasCachedCreds(deviceKey, null)
+                            app.fayaz.otgmaster.ui.DriveActionRow(
+                                primary = buildList {
+                                    add(app.fayaz.otgmaster.ui.DriveAction(null, stringResource(R.string.open_files_app)) { onOpenFilesApp(drive) })
+                                    if (!drive.isPlain) {
+                                        add(app.fayaz.otgmaster.ui.DriveAction("unmount_button", stringResource(R.string.unmount)) { onUnmount(drive) })
+                                    }
+                                },
+                                // A phone or camera over MTP is read-only: browsing is all there is.
+                                secondary = if (drive.fileSystem is app.fayaz.otgmaster.mtp.MtpStorageFileSystem) emptyList() else buildList {
+                                    add(app.fayaz.otgmaster.ui.DriveAction("format_action", stringResource(R.string.format_drive_menu),
+                                        formatUnavailable(drive)) { formatTarget = drive })
+                                    add(app.fayaz.otgmaster.ui.DriveAction("encrypt_action", stringResource(R.string.encrypt_drive_menu),
+                                        encryptUnavailable(drive)) { encryptTarget = drive })
+                                    add(app.fayaz.otgmaster.ui.DriveAction("backup_action", stringResource(R.string.backup_action),
+                                        if (drive.isReadOnly) stringResource(R.string.backup_read_only) else null) { backupTarget = drive })
+                                    add(app.fayaz.otgmaster.ui.DriveAction("recovery_action", stringResource(R.string.recovery_action),
+                                        app.fayaz.otgmaster.ui.recoveryUnavailable(drive, stringResource(R.string.recovery_not_supported))) { recoveryTarget = drive })
+                                    val driveJobs = app.fayaz.otgmaster.ui.jobsForDrive(backupJobs, drive.id)
+                                    if (driveJobs.isNotEmpty()) {
+                                        add(app.fayaz.otgmaster.ui.DriveAction("backups_action",
+                                            stringResource(R.string.backups_action, driveJobs.size)) { backupsTarget = drive })
+                                    }
+                                    if (canClearCredentials) {
+                                        add(app.fayaz.otgmaster.ui.DriveAction("clear_credentials_action",
+                                            stringResource(R.string.clear_cached_credentials)) { deviceKey?.let(onClearDeviceCreds) })
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    } // key(drive.id)
+                }
+                disconnectedDrives.forEach { gone ->
+                    key(gone.partitionKey) {
+                        app.fayaz.otgmaster.ui.DisconnectedDriveCard(gone, onDismiss = { onDismissDisconnected(gone.partitionKey) })
+                    }
+                }
+        }
+        val unlockSection: @Composable () -> Unit = {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { isVeraCryptExpanded = !isVeraCryptExpanded },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(stringResource(R.string.mount_veracrypt_drive), style = MaterialTheme.typography.titleMedium)
+                        Icon(
+                            imageVector = if (isVeraCryptExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = stringResource(R.string.cd_expand)
+                        )
+                    }
+
+                    AnimatedVisibility(visible = isVeraCryptExpanded) {
+                        key(formResetKey) {
+                            VeraCryptMountSection(
+                                showNoDriveHelp = showNoDriveHelp,
+                                deviceCandidates = deviceCandidates,
+                                onUnlock = onUnlock,
+                                autoMountEnabled = autoMountEnabled,
+                                sessionCredentials = sessionCredentials,
+                                hasCachedCreds = hasCachedCreds,
+                                isExcluded = isExcluded,
+                                onSetExcluded = onSetExcluded,
+                                isPartitionReadOnly = isPartitionReadOnly,
+                                onSetPartitionReadOnly = onSetPartitionReadOnly,
+                                onQuickUnlock = onQuickUnlock
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        val logsSection: @Composable () -> Unit = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val logsLabel = stringResource(R.string.logs)
+                Text(logsLabel, style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val ctx = androidx.compose.ui.platform.LocalContext.current
+                    TextButton(onClick = {
+                        ctx.startActivity(
+                            Intent(ctx, app.fayaz.otgmaster.feedback.FeedbackActivity::class.java)
+                        )
+                    }) {
+                        Text(stringResource(R.string.feedback_report_issue))
+                    }
+                    IconButton(onClick = { onClearLogs() }) {
+                        Icon(Icons.Default.Delete, contentDescription = stringResource(R.string.cd_clear_logs))
+                    }
+                    IconButton(onClick = { onCopyText(logs.joinToString("\n"), logsLabel) }) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = stringResource(R.string.cd_copy_logs))
+                    }
+                }
+            }
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(150.dp)
+            ) {
+                // Newest entries first so the latest status is visible without scrolling
+                // (the page itself, and this card, both have bounded/scrollable height).
+                LazyColumn(modifier = Modifier.padding(8.dp)) {
+                    items(logs.asReversed()) { log ->
+                        Text(text = log, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        }
+
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .semantics { testTagsAsResourceId = true }
+                .padding(paddingValues)
+                .consumeWindowInsets(paddingValues)
+                .imePadding()
+        ) {
+            // Two panes on a tablet, or a phone-sized window in landscape wide enough
+            // for both: the unlock form on the left, what is mounted on the right, so a
+            // mount is seen landing without scrolling past the form.
+            val twoPane = maxWidth >= 840.dp || (maxWidth > maxHeight && maxWidth >= 600.dp)
+            if (twoPane) {
+                Row(
+                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // 65/35: the form needs the width; the mounted cards fit in a narrower pane.
+                    Column(
+                        modifier = Modifier.weight(0.65f).fillMaxHeight().verticalScroll(scrollState),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        scanButton()
+                        unlockSection()
+                        logsSection()
+                    }
+                    Column(
+                        modifier = Modifier.weight(0.35f).fillMaxHeight().verticalScroll(mountedScrollState)
+                            .semantics { contentDescription = "mounted_pane" },
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        mountedSection(true)
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    scanButton()
+                    mountedSection(false)
+                    if (mountedDrives.isNotEmpty()) Spacer(modifier = Modifier.height(16.dp))
+                    unlockSection()
+                    logsSection()
+                }
+            }
+        }
+    }
+
+    SettingsDrawer(
+        visible = showSettings,
+        currentTheme = themeMode,
+        versionName = versionName,
+        versionCode = versionCode,
+        autoMountEnabled = autoMountEnabled,
+        onThemeSelected = onThemeChange,
+        onAutoMountEnabledChange = onAutoMountEnabledChange,
+        onClearAllCredentials = onClearAllCredentials,
+        onCopyText = onCopyText,
+        onDismiss = { showSettings = false },
+        readOnlyDefault = readOnlyDefault,
+        onReadOnlyDefaultChange = onReadOnlyDefaultChange,
+    )
+
+    AnimatedVisibility(
+        visible = toastMessage != null,
+        enter = slideInVertically(initialOffsetY = { it }),
+        exit = slideOutVertically(targetOffsetY = { it }),
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .navigationBarsPadding()
+            .padding(16.dp)
+    ) {
+        toastMessage?.let { msg ->
+            LaunchedEffect(msg) {
+                delay(2500)
+                onToastDismiss()
+            }
+            Surface(
+                color = if (toastIsSuccess) Color(0xFF2E7D32) else Color(0xFFC62828),
+                shape = RoundedCornerShape(8.dp),
+                shadowElevation = 6.dp
+            ) {
+                Text(
+                    text = msg,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+        }
+    }
+    }
+}
+
+@Composable
+fun VeraCryptMountSection(
+    deviceCandidates: List<UsbDeviceCandidate>,
+    showNoDriveHelp: Boolean = false,
+    onUnlock: (String, VolumeCandidate, String, Int?, List<Uri>, app.fayaz.otgmaster.veracrypt.VeraCryptCipher, app.fayaz.otgmaster.veracrypt.VeraCryptHash, () -> Unit) -> Unit,
+    autoMountEnabled: Boolean = false,
+    sessionCredentials: Map<String, app.fayaz.otgmaster.security.CredentialStore.Credentials> = emptyMap(),
+    hasCachedCreds: (String, Long?) -> Boolean = { _, _ -> false },
+    isExcluded: (String) -> Boolean = { false },
+    onSetExcluded: (String, Boolean) -> Unit = { _, _ -> },
+    isPartitionReadOnly: (String, Long) -> Boolean = { _, _ -> false },
+    onSetPartitionReadOnly: (String, Long, Boolean) -> Unit = { _, _, _ -> },
+    onQuickUnlock: ((String, VolumeCandidate, () -> Unit) -> Unit)? = null
+) {
+    var isUnlocking by remember { mutableStateOf(false) }
+    var selectedDevice by remember(deviceCandidates) { mutableStateOf(deviceCandidates.firstOrNull()) }
+    var deviceExpanded by remember { mutableStateOf(false) }
+    val candidates = selectedDevice?.candidates.orEmpty()
+    val hiddenPartitions = selectedDevice?.hiddenPartitions ?: 0
+
+    val sessionCreds = sessionCredentials[selectedDevice?.deviceName]
+    val isPreFilled = sessionCreds != null
+
+    var selectedCandidate by remember(selectedDevice) { mutableStateOf(
+        sessionCreds?.let { sc -> selectedDevice?.candidates?.find { it.startBlock == sc.candidateStartBlock } }
+            ?: selectedDevice?.candidates?.firstOrNull()
+    ) }
+    val isBitLocker = selectedCandidate?.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.BITLOCKER
+    val isApfs = selectedCandidate?.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.APFS
+    // "isLuks" gates the VeraCrypt-only fields (PIM, keyfiles, cipher, hash), which
+    // BitLocker and APFS have no use for either: their ciphers are read from the volume.
+    val isLuks = selectedCandidate?.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.LUKS1 ||
+                 selectedCandidate?.containerType == app.fayaz.otgmaster.veracrypt.ContainerType.LUKS2 ||
+                 isBitLocker || isApfs
+    var expanded by remember { mutableStateOf(false) }
+
+    var password by remember(selectedDevice) { mutableStateOf(sessionCreds?.password ?: "") }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var pim by remember(selectedDevice) { mutableStateOf(sessionCreds?.pim ?: "") }
+    var keyfiles by remember(selectedDevice) { mutableStateOf(sessionCreds?.keyfileUris ?: emptyList<Uri>()) }
+    var selectedCipher by remember(selectedDevice) { mutableStateOf(
+        sessionCreds?.cipherName?.let { n -> app.fayaz.otgmaster.veracrypt.VeraCryptCipher.entries.find { it.name == n } }
+            ?: app.fayaz.otgmaster.veracrypt.VeraCryptCipher.DEFAULT
+    ) }
+    var cipherExpanded by remember { mutableStateOf(false) }
+    var selectedHash by remember(selectedDevice) { mutableStateOf(
+        sessionCreds?.hashName?.let { n -> app.fayaz.otgmaster.veracrypt.VeraCryptHash.entries.find { it.name == n } }
+            ?: app.fayaz.otgmaster.veracrypt.VeraCryptHash.DEFAULT
+    ) }
+    var hashExpanded by remember { mutableStateOf(false) }
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    val keyfileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        uris.forEach { uri ->
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+        }
+        keyfiles = uris
+        focusManager.clearFocus()
+    }
+
+    Column(
+        modifier = Modifier.padding(top = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (deviceCandidates.isEmpty()) {
+            Text(stringResource(R.string.no_devices_available), color = MaterialTheme.colorScheme.error)
+            if (showNoDriveHelp) app.fayaz.otgmaster.ui.NoDriveHelpLink()
+        } else {
+            if (deviceCandidates.size == 1) {
+                Text(
+                    stringResource(R.string.unlocking_drive_label, selectedDevice?.displayName ?: ""),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (deviceCandidates.size > 1) {
+                @OptIn(ExperimentalMaterial3Api::class)
+                ExposedDropdownMenuBox(
+                    expanded = deviceExpanded,
+                    onExpandedChange = { deviceExpanded = !deviceExpanded }
+                ) {
+                    OutlinedTextField(
+                        value = selectedDevice?.displayName ?: "",
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text(stringResource(R.string.label_usb_drive)) },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = deviceExpanded) },
+                        colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                        modifier = Modifier.menuAnchor().fillMaxWidth().semantics { contentDescription = "device_picker" }
+                    )
+                    ExposedDropdownMenu(
+                        expanded = deviceExpanded,
+                        onDismissRequest = { deviceExpanded = false }
+                    ) {
+                        deviceCandidates.forEach { device ->
+                            DropdownMenuItem(
+                                text = { Text(device.displayName) },
+                                onClick = {
+                                    selectedDevice = device
+                                    deviceExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            val currentDeviceName = selectedDevice?.deviceName ?: ""
+            // Check only the selected candidate — if it has cached creds offer biometric,
+            // otherwise show the password form so the user can enter creds manually.
+            val showQuickUnlock = hasCachedCreds(currentDeviceName, selectedCandidate?.startBlock) &&
+                onQuickUnlock != null
+
+            if (candidates.isEmpty()) {
+                Text(stringResource(R.string.no_candidates_found), color = MaterialTheme.colorScheme.error)
+            } else {
+            // With one candidate there is nothing to choose, so no picker is drawn —
+            // which left its encryption type shown nowhere in the UI. Render the same
+            // label-and-tag row the picker uses, without the dropdown affordance.
+            if (candidates.size == 1) {
+                val only = candidates.first()
+                val tag = encryptionTag(only.containerType)
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(only.label, modifier = Modifier.weight(1f))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    DriveTag(label = tag.first, color = tag.second)
+                }
+            }
+            // Partition picker: always visible when there are multiple candidates so the
+            // user can choose which one to unlock, regardless of whether quick-unlock applies.
+            if (candidates.size > 1) {
+            @OptIn(ExperimentalMaterial3Api::class)
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { expanded = !expanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedCandidate?.label ?: "",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text(stringResource(R.string.label_volume_to_unlock)) },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                    colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                    modifier = Modifier.menuAnchor().fillMaxWidth().semantics { contentDescription = "candidate_picker" }
+                )
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    candidates.forEach { candidate ->
+                        val tag = encryptionTag(candidate.containerType)
+                        DropdownMenuItem(
+                            text = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(candidate.label, modifier = Modifier.weight(1f))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    DriveTag(label = tag.first, color = tag.second)
+                                }
+                            },
+                            onClick = {
+                                selectedCandidate = candidate
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
+            }
+            // The picker only lists partitions it can act on. Without this note a
+            // drive whose other partitions were filtered out looks like it has
+            // fewer partitions than it does — which is how drive D's NTFS
+            // partition went missing with no explanation anywhere in the UI.
+            if (hiddenPartitions > 0) {
+                Text(
+                    text = stringResource(R.string.volume_picker_filtered_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 4.dp)
+                )
+            }
+
+            // Per partition, starting from Settings → Read-only mode. Stored, so auto
+            // mount and quick unlock mount this partition the same way next time.
+            // Above both branches: with saved credentials the form is only the
+            // fingerprint button, and the switch has to be reachable there too.
+            selectedCandidate?.let { sc ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        stringResource(R.string.mount_read_only),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Switch(
+                        checked = isPartitionReadOnly(currentDeviceName, sc.startBlock),
+                        onCheckedChange = { onSetPartitionReadOnly(currentDeviceName, sc.startBlock, it) },
+                        modifier = Modifier.semantics { contentDescription = "read_only_switch" }
+                    )
+                }
+            }
+
+            if (showQuickUnlock) {
+                Button(
+                    onClick = {
+                        isUnlocking = true
+                        val device = selectedDevice
+                        val candidate = selectedCandidate
+                        if (device != null && candidate != null) {
+                            onQuickUnlock!!(device.deviceName, candidate) { isUnlocking = false }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().semantics { contentDescription = "mount_button" },
+                    enabled = selectedDevice != null && selectedCandidate != null && !isUnlocking
+                ) {
+                    if (isUnlocking) {
+                        androidx.compose.material3.CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(stringResource(R.string.unlocking_in_progress))
+                    } else {
+                        Icon(Icons.Default.Fingerprint, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(stringResource(R.string.unlock_and_mount))
+                    }
+                }
+            } else {
+            
+            OutlinedTextField(
+                value = password,
+                onValueChange = { if (!isPreFilled) password = it },
+                label = { Text(stringResource(when {
+                    isBitLocker -> R.string.label_bitlocker_password
+                    isApfs -> R.string.label_apfs_password
+                    isLuks -> R.string.label_password
+                    else -> R.string.label_veracrypt_password
+                })) },
+                singleLine = true,
+                readOnly = isPreFilled,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrect = false, imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                    focusManager.clearFocus()
+                }),
+                visualTransformation = if (passwordVisible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                        Icon(
+                            imageVector = if (passwordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = if (passwordVisible) stringResource(R.string.cd_hide_password) else stringResource(R.string.cd_show_password)
+                        )
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics { contentDescription = "password_input" }
+            )
+
+            if (!isLuks) {
+            OutlinedTextField(
+                value = pim,
+                onValueChange = { if (!isPreFilled) pim = it },
+                label = { Text(stringResource(R.string.label_pim)) },
+                singleLine = true,
+                readOnly = isPreFilled,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, autoCorrect = false, imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                    focusManager.clearFocus()
+                }),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics { contentDescription = "pim_input" }
+            )
+
+            if (!isPreFilled) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { keyfileLauncher.launch(arrayOf("*/*")) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(stringResource(R.string.select_keyfiles, keyfiles.size))
+                }
+                if (keyfiles.isNotEmpty()) {
+                    IconButton(onClick = { keyfiles = emptyList() }) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = stringResource(R.string.cd_clear_keyfiles)
+                        )
+                    }
+                }
+            }
+            } else if (keyfiles.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.select_keyfiles, keyfiles.size),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            } // end if (!isLuks) for PIM + keyfiles
+
+            if (autoMountEnabled) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        stringResource(R.string.auto_mount_exclude_device),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Switch(
+                        checked = isExcluded(currentDeviceName),
+                        onCheckedChange = { onSetExcluded(currentDeviceName, it) }
+                    )
+                }
+            }
+
+
+            if (!isLuks) {
+            @OptIn(ExperimentalMaterial3Api::class)
+            ExposedDropdownMenuBox(
+                expanded = if (isPreFilled) false else cipherExpanded,
+                onExpandedChange = { if (!isPreFilled) cipherExpanded = !cipherExpanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedCipher.displayName,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text(stringResource(R.string.label_encryption_algorithm)) },
+                    trailingIcon = { if (!isPreFilled) ExposedDropdownMenuDefaults.TrailingIcon(expanded = cipherExpanded) },
+                    colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                    modifier = Modifier.menuAnchor().fillMaxWidth().semantics { contentDescription = "cipher_picker" }
+                )
+                if (!isPreFilled) {
+                    ExposedDropdownMenu(
+                        expanded = cipherExpanded,
+                        onDismissRequest = { cipherExpanded = false }
+                    ) {
+                        app.fayaz.otgmaster.veracrypt.VeraCryptCipher.entries.forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(if (option.isSupported) option.displayName else stringResource(R.string.algorithm_not_supported, option.displayName)) },
+                                onClick = {
+                                    selectedCipher = option
+                                    cipherExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            @OptIn(ExperimentalMaterial3Api::class)
+            ExposedDropdownMenuBox(
+                expanded = if (isPreFilled) false else hashExpanded,
+                onExpandedChange = { if (!isPreFilled) hashExpanded = !hashExpanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedHash.displayName,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text(stringResource(R.string.label_hash_algorithm)) },
+                    trailingIcon = { if (!isPreFilled) ExposedDropdownMenuDefaults.TrailingIcon(expanded = hashExpanded) },
+                    colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                    modifier = Modifier.menuAnchor().fillMaxWidth().semantics { contentDescription = "hash_picker" }
+                )
+                if (!isPreFilled) {
+                    ExposedDropdownMenu(
+                        expanded = hashExpanded,
+                        onDismissRequest = { hashExpanded = false }
+                    ) {
+                        app.fayaz.otgmaster.veracrypt.VeraCryptHash.entries.forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(if (option.isSupported) option.displayName else stringResource(R.string.algorithm_not_supported, option.displayName)) },
+                                onClick = {
+                                    selectedHash = option
+                                    hashExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+            } // end if (!isLuks) for cipher + hash
+
+            Button(
+                onClick = {
+                    focusManager.clearFocus()
+                    isUnlocking = true
+                    val device = selectedDevice
+                    val candidate = selectedCandidate
+                    if (device != null && candidate != null) {
+                        onUnlock(device.deviceName, candidate, password, pim.toIntOrNull(), keyfiles, selectedCipher, selectedHash) { isUnlocking = false }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "mount_button" },
+                enabled = selectedDevice != null && selectedCandidate != null &&
+                    (password.isNotEmpty() || isBitLocker || (!isLuks && keyfiles.isNotEmpty())) && !isUnlocking
+            ) {
+                if (isUnlocking) {
+                    androidx.compose.material3.CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(stringResource(R.string.unlocking_in_progress))
+                } else {
+                    Text(stringResource(R.string.unlock_and_mount))
+                }
+            }
+            }
+            }
+        }
+    }
+}
+
+enum class ThemeMode {
+    SYSTEM, LIGHT, DARK
+}
+
+fun themeStringRes(mode: ThemeMode): Int = when (mode) {
+    ThemeMode.SYSTEM -> R.string.theme_system
+    ThemeMode.LIGHT -> R.string.theme_light
+    ThemeMode.DARK -> R.string.theme_dark
+}
+
+/**
+ * A single collapsed-by-default settings entry: a tappable row showing a title and a
+ * one-line summary of its current value, expanding in place to reveal its full content.
+ * Keeping each setting in its own row like this lets new settings be added later without
+ * the drawer growing into an unscannable wall of controls.
+ */
+@Composable
+fun SettingsExpandableRow(
+    title: String,
+    summary: String,
+    content: @Composable () -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(
+                imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = null
+            )
+        }
+        AnimatedVisibility(visible = expanded) {
+            Column(modifier = Modifier.padding(bottom = 8.dp)) {
+                content()
+            }
+        }
+        HorizontalDivider()
+    }
+}
+
+@Composable
+fun SettingsDrawer(
+    visible: Boolean,
+    currentTheme: ThemeMode,
+    versionName: String,
+    versionCode: Long,
+    autoMountEnabled: Boolean,
+    onThemeSelected: (ThemeMode) -> Unit,
+    onAutoMountEnabledChange: (Boolean) -> Unit,
+    onClearAllCredentials: () -> Unit,
+    onCopyText: (String, String) -> Unit,
+    onDismiss: () -> Unit,
+    readOnlyDefault: Boolean = false,
+    onReadOnlyDefaultChange: (Boolean) -> Unit = {},
+) {
+    if (!visible) return
+
+    val versionText = stringResource(R.string.version_label, versionName, versionCode)
+    val versionLabelShort = stringResource(R.string.version_label_short)
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.32f))
+                .clickable(onClick = onDismiss)
+        )
+
+        AnimatedVisibility(
+            visible = true,
+            enter = slideInHorizontally(initialOffsetX = { it }),
+            exit = slideOutHorizontally(targetOffsetX = { it }),
+            modifier = Modifier.align(Alignment.CenterEnd)
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .width(300.dp),
+                tonalElevation = 4.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Vertical + WindowInsetsSides.End))
+                        .padding(16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(stringResource(R.string.settings_title), style = MaterialTheme.typography.headlineSmall)
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = stringResource(R.string.cd_close_settings))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    HorizontalDivider()
+
+                    // Scrolls independently of the header, which stays reachable. The
+                    // drawer is a fixed 300.dp column and an expanded row can exceed the
+                    // screen on its own.
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                    SettingsExpandableRow(
+                        title = stringResource(R.string.theme_label),
+                        summary = stringResource(themeStringRes(currentTheme))
+                    ) {
+                        ThemeMode.entries.forEach { mode ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onThemeSelected(mode) }
+                                    .padding(vertical = 4.dp)
+                            ) {
+                                RadioButton(
+                                    selected = mode == currentTheme,
+                                    onClick = { onThemeSelected(mode) }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(stringResource(themeStringRes(mode)))
+                            }
+                        }
+                    }
+
+                    SettingsExpandableRow(
+                        title = stringResource(R.string.auto_mount_title),
+                        summary = if (autoMountEnabled) "On" else "Off"
+                    ) {
+                        Text(
+                            stringResource(R.string.auto_mount_description),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                stringResource(R.string.auto_mount_title),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Switch(
+                                checked = autoMountEnabled,
+                                onCheckedChange = onAutoMountEnabledChange
+                            )
+                        }
+                        if (autoMountEnabled) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onClearAllCredentials,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(stringResource(R.string.auto_mount_clear_credentials))
+                            }
+                        }
+                    }
+
+                    SettingsExpandableRow(
+                        title = stringResource(R.string.read_only_mode_title),
+                        summary = if (readOnlyDefault) "On" else "Off"
+                    ) {
+                        Text(
+                            stringResource(R.string.read_only_mode_description),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                stringResource(R.string.read_only_mode_title),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Switch(
+                                checked = readOnlyDefault,
+                                onCheckedChange = onReadOnlyDefaultChange
+                            )
+                        }
+                    }
+
+                    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+
+                    SettingsExpandableRow(
+                        title = stringResource(R.string.app_version_label),
+                        summary = versionText
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onCopyText(versionText, versionLabelShort) }
+                                .padding(vertical = 4.dp)
+                        ) {
+                            Text(versionText, style = MaterialTheme.typography.bodyMedium)
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = stringResource(R.string.cd_copy_version),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    val donateUrl = stringResource(R.string.donate_url)
+                    SettingsExpandableRow(
+                        title = stringResource(R.string.donate_title),
+                        summary = stringResource(R.string.donate_summary)
+                    ) {
+                        TextButton(
+                            onClick = { uriHandler.openUri(donateUrl) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(donateUrl)
+                        }
+                        Text(
+                            stringResource(R.string.donate_thank_you),
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A failure's reason for the app's log. `e.message` alone printed "null" for exceptions
+ * that carry none (#98: "Failed to mount exFAT: null"), so the type is named instead, and
+ * the cause when there is one.
+ */
+internal fun Throwable.reason(): String {
+    val own = when (this) {
+        is me.jahnen.libaums.core.fs.FileSystemFactory.UnsupportedFileSystemException ->
+            "no filesystem driver accepted the volume (see the lines above for why)"
+        else -> message?.takeIf { it.isNotBlank() } ?: javaClass.simpleName
+    }
+    val c = cause ?: return own
+    return "$own (cause: ${c.javaClass.simpleName}: ${c.message})"
+}
+
+/** [Throwable.reason] for Java-style callers and other files. */
+internal fun reasonOf(t: Throwable): String = t.reason()

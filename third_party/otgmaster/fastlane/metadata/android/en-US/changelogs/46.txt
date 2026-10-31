@@ -1,0 +1,22 @@
+• New: LUKS1 and LUKS2 encrypted volumes are now supported alongside VeraCrypt
+• New: ext4 filesystems are now supported for reading and writing, alongside FAT32 and exFAT
+• New: On ext4 you can create files and directories, write and modify data, delete, and rename
+• New: Read-only mode — mount an encrypted partition so nothing can be written to the drive. Choose per partition in the unlock form, or turn it on for all partitions in Settings
+• New: The unlock form automatically detects whether a partition is LUKS or VeraCrypt and shows only the relevant fields
+• New: Drives with no recognisable encrypted partitions now display a clear "no encrypted volumes found" message instead of a confusing empty list
+• New: Mounted drive cards show the device name and partition, with colour-coded tags for encryption type and filesystem
+• New: The volume picker tags each partition with its encryption type, so you can tell LUKS1, LUKS2 and VeraCrypt apart at a glance
+• New: The volume picker lists only partitions you can actually unlock, and says so, instead of offering ones that could never be mounted
+• Fixed: Unencrypted partitions were labelled "VERACRYPT" in the volume picker, and selecting one produced a misleading "failed to unlock" instead of saying it is not encrypted
+• Fixed: On a drive holding both encrypted and unencrypted partitions, the encrypted partition could become unreachable after dismissing the Auto mount prompt
+• Fixed: On a drive holding both encrypted and unencrypted partitions, unmounting and remounting could fail to unlock until the drive was unplugged and plugged back in
+• Fixed: An unencrypted drive's card offered to clear cached credentials it does not have
+• Fixed: SD cards in a USB card reader could fail to open the first time they were plugged in, until Scan USB Devices was tapped
+• Fixed: An ext4 drive that was not unmounted cleanly — for example one another device or Android itself had mounted — is now opened read-only and marked with a READ-ONLY tag, instead of being written to, which could damage it
+• Fixed: FAT32 drives written by the app were reported as damaged by disk checkers on Windows, macOS and Linux, because only one of the drive's two allocation tables was being updated
+• Fixed: On a FAT32 drive whose allocation table was already damaged, deleting a file could wipe parts of other files and of the drive's own structures. The damage is now contained to the file being deleted
+• Fixed: On drives with several encrypted partitions, some partitions could fail to mount, and unmounting one could disconnect the others
+• Fixed: A brief USB error during a read or write could make it fail, leave the drive unresponsive until it was unplugged, or in some cases read or write the wrong data without reporting an error
+• Fixed: A temporary USB read error no longer discards the credentials you asked the app to remember for a partition
+• Fixed: In the dark theme, the status bar's clock and icons were dark on a dark background
+• Known issue: unplugging an exFAT drive while files are being written to it can damage it. Unmount before unplugging, and check the drive on a computer if it drops mid-write
