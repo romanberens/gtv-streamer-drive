@@ -138,7 +138,11 @@ class MainActivity : ComponentActivity() {
                         activeRoot?.let { formatSize(it.freeBytes) } ?: "—",
                         "Dostępne na dysku", activeRoot != null, Modifier.weight(1f))
                     StatusCard("ZAPIS",
-                        if (activeRoot?.writable == true) "Odczyt i zapis" else "Niedostępny",
+                        when (activeRoot?.writable) {
+                            true -> "Odczyt i zapis"
+                            false -> "Tylko odczyt"
+                            null -> "Brak dysku"
+                        },
                         if (activeRoot?.writable == true) "Telefon → USB" else "Sprawdź dostęp",
                         activeRoot?.writable == true, Modifier.weight(1f))
                     StatusCard("TELEFONY", uploadServer.pairedCount.toString() + " sparowanych",
@@ -160,7 +164,10 @@ class MainActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("MENU", color = Color(0xFFAAC0CB), fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold)
-                            SideNav("▤  Przeglądaj", true) { }
+                            SideNav("▤  Przeglądaj", true) {
+                                current = activeRoot?.let { BrowserLocation(it.documentId, it.title) }
+                                stack = emptyList()
+                            }
                             SideNav("▣  Sparuj telefon", false) {
                                 pairingUrl = uploadServer.beginPairing()
                             }
