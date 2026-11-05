@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
+import java.security.MessageDigest
+import java.security.DigestInputStream
 
 data class NasDiskItem(
     val id: String,
@@ -165,16 +167,37 @@ class NasStorageOps(
 
         var copyCompleted = false
         try {
+            val sourceDigest = MessageDigest.getInstance("SHA-256")
             val bytes = (resolver.openInputStream(document(sourceId))
                 ?: error("Nie mozna odczytac pliku")).use { input ->
-                (resolver.openOutputStream(created, "w")
-                    ?: error("Nie mozna zapisac pliku")).use { output ->
-                    input.copyTo(output, 128 * 1024)
+                DigestInputStream(input, sourceDigest).use { hashedInput ->
+                    (resolver.openOutputStream(created, "w")
+                        ?: error("Nie mozna zapisac pliku")).use { output ->
+                        hashedInput.copyTo(output, 128 * 1024)
+                    }
                 }
             }
-            // Disk provider reports reliable file sizes; only delete after full copy.
             check(bytes == source.size) {
                 "Rozmiar kopii nie zgadza sie z oryginalem; oryginal zachowany"
+            }
+            // Read the copy back from USB; don't delete source on silent disk corruption.
+            val targetDigest = MessageDigest.getInstance("SHA-256")
+            val storedBytes = (resolver.openInputStream(created)
+                ?: error("Nie mozna zweryfikowac kopii")).use { input ->
+                DigestInputStream(input, targetDigest).use { digestStream ->
+                    val buffer = ByteArray(128 * 1024)
+                    var count = 0L
+                    while (true) {
+                        val read = digestStream.read(buffer)
+                        if (read < 0) break
+                        count += read
+                    }
+                    count
+                }
+            }
+            check(storedBytes == bytes &&
+                MessageDigest.isEqual(sourceDigest.digest(), targetDigest.digest())) {
+                "Kopia nie przeszla weryfikacji SHA-256; oryginal zachowany"
             }
             copyCompleted = true
         } finally {
