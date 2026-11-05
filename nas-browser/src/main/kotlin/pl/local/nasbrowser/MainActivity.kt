@@ -15,6 +15,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -39,13 +42,18 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.text.DateFormat
@@ -95,7 +103,30 @@ class MainActivity : ComponentActivity() {
         var current by remember { mutableStateOf<BrowserLocation?>(null) }
         var stack by remember { mutableStateOf(emptyList<BrowserLocation>()) }
         var pairingUrl by remember { mutableStateOf<String?>(null) }
-        var gridView by remember { mutableStateOf(false) }
+        val uiPrefs = remember { getSharedPreferences("nas_ui", MODE_PRIVATE) }
+        // 0 = list, 1 = thumbnails, 2 = large thumbnails.
+        var viewMode by remember {
+            mutableIntStateOf(uiPrefs.getInt("view_mode", 2).coerceIn(0, 2))
+        }
+        var rightCollapsed by remember {
+            mutableStateOf(uiPrefs.getBoolean("right_collapsed", true))
+        }
+        var phoneExpanded by remember {
+            mutableStateOf(uiPrefs.getBoolean("phone_expanded", true))
+        }
+        var transfersExpanded by remember {
+            mutableStateOf(uiPrefs.getBoolean("transfers_expanded", false))
+        }
+        var codeExpanded by remember {
+            mutableStateOf(uiPrefs.getBoolean("code_expanded", false))
+        }
+        val installedVersion = remember {
+            runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
+                .getOrNull() ?: "?"
+        }
+        fun setUiFlag(key: String, value: Boolean) {
+            uiPrefs.edit().putBoolean(key, value).apply()
+        }
         var selected by remember { mutableStateOf<StorageEntry?>(null) }
         var nameDialog by remember { mutableStateOf<String?>(null) }
         var inputName by remember { mutableStateOf("") }
@@ -184,7 +215,7 @@ class MainActivity : ComponentActivity() {
                             fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                     Spacer(Modifier.width(16.dp))
-                    Text("v0.2.1 • UI", color = Color(0xFF879EAE), fontSize = 12.sp)
+                    Text("v$installedVersion • UI", color = Color(0xFF879EAE), fontSize = 12.sp)
                 }
 
                 Spacer(Modifier.height(18.dp))
@@ -278,9 +309,16 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 TvButton(
-                                    if (gridView) "Lista" else "Miniatury",
-                                    if (gridView) NasGlyph.DOCUMENT else NasGlyph.IMAGE
-                                ) { gridView = !gridView }
+                                    when (viewMode) {
+                                        0 -> "Siatka"
+                                        1 -> "Duże zdjęcia"
+                                        else -> "Lista"
+                                    },
+                                    if (viewMode == 2) NasGlyph.DOCUMENT else NasGlyph.IMAGE
+                                ) {
+                                    viewMode = (viewMode + 1) % 3
+                                    uiPrefs.edit().putInt("view_mode", viewMode).apply()
+                                }
                                 if (stack.isNotEmpty()) {
                                     Spacer(Modifier.width(8.dp))
                                     TvButton("Wstecz", NasGlyph.BACK) {
@@ -289,7 +327,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
-                            Spacer(Modifier.height(10.dp))
+                            Spacer(Modifier.height(6.dp))
                             if (activeRoot != null) {
                                 Row(
                                     Modifier.fillMaxWidth(),
@@ -340,101 +378,88 @@ class MainActivity : ComponentActivity() {
                                         current = BrowserLocation(entry.documentId, entry.name)
                                     } else openFile(entry)
                                 }
-                                if (gridView) {
-                                    LazyVerticalGrid(
-                                        columns = GridCells.Adaptive(minSize = 146.dp),
-                                        verticalArrangement = Arrangement.spacedBy(9.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(9.dp),
-                                        contentPadding = PaddingValues(bottom = 28.dp)
-                                    ) {
-                                        gridItems(entries, key = { it.documentId }) { entry ->
-                                            FileTile(entry, { openEntry(entry) }, { selected = entry })
-                                        }
-                                    }
-                                } else {
-                                    LazyColumn(
-                                        verticalArrangement = Arrangement.spacedBy(7.dp),
-                                        contentPadding = PaddingValues(bottom = 24.dp)
-                                    ) {
-                                        items(entries, key = { it.documentId }) { entry ->
-                                            FileRow(entry, { openEntry(entry) }, { selected = entry })
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        Column(Modifier.width(250.dp).fillMaxHeight(),
-                            verticalArrangement = Arrangement.spacedBy(11.dp)) {
-                            Column(Modifier.fillMaxWidth()
-                                .background(Color(0xFF142E3B), RoundedCornerShape(16.dp))
-                                .padding(16.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(Modifier.size(37.dp)
-                                        .background(Color(0xFF22535A), RoundedCornerShape(10.dp)),
-                                        contentAlignment = Alignment.Center) {
-                                        NasIcon(NasGlyph.PHONE, Modifier.size(23.dp), Color(0xFF66E4C9))
-                                    }
-                                    Spacer(Modifier.width(9.dp))
-                                    Text("Telefon → NAS", color = Color.White, fontSize = 18.sp,
-                                        fontWeight = FontWeight.Bold)
-                                }
-                                Spacer(Modifier.height(10.dp))
-                                Text("Przesyłaj zdjęcia, filmy i inne pliki bezpośrednio na USB.",
-                                    color = Color(0xFFA8BFCC), fontSize = 12.sp, lineHeight = 17.sp)
-                                Spacer(Modifier.height(13.dp))
-                                TvButton("Sparuj przez QR", NasGlyph.QR, primary = true) {
-                                    pairingUrl = uploadServer.beginPairing()
-                                }
-                            }
-
-                            Column(Modifier.fillMaxWidth().weight(1f)
-                                .background(Color(0xFF112232), RoundedCornerShape(16.dp))
-                                .padding(15.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    NasIcon(NasGlyph.CLOCK, Modifier.size(19.dp), Color(0xFF66E4C9))
-                                    Spacer(Modifier.width(9.dp))
-                                    Text("Ostatnie transfery", color = Color.White,
-                                        fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                                }
-                                Spacer(Modifier.height(13.dp))
-                                val history = remember(refreshTick) { uploadServer.recentTransfers }
-                                if (history.isEmpty()) {
-                                    Text("Brak ukończonych transferów.",
-                                        color = Color(0xFF9BB2C1), fontSize = 12.sp)
-                                } else {
-                                    history.take(4).forEach { transfer ->
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            NasIcon(NasGlyph.CHECK, Modifier.size(16.dp),
-                                                Color(0xFF66E4C9))
-                                            Spacer(Modifier.width(7.dp))
-                                            Column(Modifier.weight(1f)) {
-                                                Text(transfer.name, color = Color.White,
-                                                    fontSize = 12.sp, maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis)
-                                                Text(formatSize(transfer.size) + " • Zakończono",
-                                                    color = Color(0xFF9FB8C8), fontSize = 11.sp)
+                                Crossfade(
+                                    targetState = viewMode,
+                                    animationSpec = tween(durationMillis = 190),
+                                    label = "nasFileView"
+                                ) { mode ->
+                                    if (mode == 0) {
+                                        LazyColumn(
+                                            modifier = Modifier.fillMaxSize(),
+                                            verticalArrangement = Arrangement.spacedBy(7.dp),
+                                            contentPadding = PaddingValues(bottom = 24.dp)
+                                        ) {
+                                            items(entries, key = { it.documentId }) { entry ->
+                                                FileRow(entry, { openEntry(entry) }, { selected = entry })
                                             }
                                         }
-                                        Spacer(Modifier.height(13.dp))
+                                    } else {
+                                        LazyVerticalGrid(
+                                            modifier = Modifier.fillMaxSize(),
+                                            columns = GridCells.Adaptive(
+                                                minSize = if (mode == 2) 230.dp else 160.dp
+                                            ),
+                                            verticalArrangement = Arrangement.spacedBy(11.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(11.dp),
+                                            contentPadding = PaddingValues(bottom = 25.dp)
+                                        ) {
+                                            gridItems(entries, key = { it.documentId }) { entry ->
+                                                FileTile(
+                                                    entry,
+                                                    large = mode == 2,
+                                                    onClick = { openEntry(entry) },
+                                                    onManage = { selected = entry }
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
-
-                            Column(Modifier.fillMaxWidth()
-                                .background(Color(0xFF112232), RoundedCornerShape(14.dp))
-                                .padding(13.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    NasIcon(NasGlyph.INFO, Modifier.size(16.dp), Color(0xFF66E4C9))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("KOD AWARYJNY", color = Color(0xFF9FB8C8),
-                                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                }
-                                Spacer(Modifier.height(4.dp))
-                                Text(uploadServer.accessCode, color = Color(0xFF66E4C9),
-                                    fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                            }
                         }
+
+                        NasRightPanel(
+                            collapsed = rightCollapsed,
+                            phoneExpanded = phoneExpanded,
+                            transfersExpanded = transfersExpanded,
+                            codeExpanded = codeExpanded,
+                            recentTransfers = remember(refreshTick) { uploadServer.recentTransfers },
+                            accessCode = uploadServer.accessCode,
+                            onCollapse = {
+                                rightCollapsed = !rightCollapsed
+                                setUiFlag("right_collapsed", rightCollapsed)
+                            },
+                            onOpenPhone = {
+                                rightCollapsed = false
+                                phoneExpanded = true
+                                setUiFlag("right_collapsed", false)
+                                setUiFlag("phone_expanded", true)
+                            },
+                            onOpenTransfers = {
+                                rightCollapsed = false
+                                transfersExpanded = true
+                                setUiFlag("right_collapsed", false)
+                                setUiFlag("transfers_expanded", true)
+                            },
+                            onOpenCode = {
+                                rightCollapsed = false
+                                codeExpanded = true
+                                setUiFlag("right_collapsed", false)
+                                setUiFlag("code_expanded", true)
+                            },
+                            onTogglePhone = {
+                                phoneExpanded = !phoneExpanded
+                                setUiFlag("phone_expanded", phoneExpanded)
+                            },
+                            onToggleTransfers = {
+                                transfersExpanded = !transfersExpanded
+                                setUiFlag("transfers_expanded", transfersExpanded)
+                            },
+                            onToggleCode = {
+                                codeExpanded = !codeExpanded
+                                setUiFlag("code_expanded", codeExpanded)
+                            },
+                            onPair = { pairingUrl = uploadServer.beginPairing() }
+                        )
                     }
                 }
             }
@@ -545,8 +570,15 @@ class MainActivity : ComponentActivity() {
         var focused by remember { mutableStateOf(false) }
         val shape = RoundedCornerShape(11.dp)
         val highlighted = focused || active
+        val focusScale by animateFloatAsState(
+            if (focused) 1.025f else 1f,
+            animationSpec = tween(durationMillis = 160),
+            label = "nasMenuFocus"
+        )
         Row(
             Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }
+                .zIndex(if (focused) 1f else 0f)
+                .graphicsLayer { scaleX = focusScale; scaleY = focusScale }
                 .clip(shape)
                 .background(if (highlighted) Color(0xFF66E4C9) else Color.Transparent)
                 .border(if (focused) 2.dp else 0.dp,
@@ -622,8 +654,15 @@ class MainActivity : ComponentActivity() {
         var focused by remember { mutableStateOf(false) }
         val shape = RoundedCornerShape(11.dp)
         val bright = focused || primary
+        val focusScale by animateFloatAsState(
+            if (focused) 1.025f else 1f,
+            animationSpec = tween(durationMillis = 160),
+            label = "nasButtonFocus"
+        )
         Row(
             Modifier.onFocusChanged { focused = it.isFocused }
+                .zIndex(if (focused) 1f else 0f)
+                .graphicsLayer { scaleX = focusScale; scaleY = focusScale }
                 .clip(shape)
                 .background(if (bright) Color(0xFF66E4C9) else Color(0xFF223A4D))
                 .border(if (focused) 2.dp else 0.dp,
@@ -721,29 +760,91 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun FileTile(
-        entry: StorageEntry, onClick: () -> Unit, onManage: () -> Unit
+        entry: StorageEntry,
+        large: Boolean,
+        onClick: () -> Unit,
+        onManage: () -> Unit
     ) {
         var focused by remember { mutableStateOf(false) }
-        val shape = RoundedCornerShape(13.dp)
-        Column(Modifier.onFocusChanged { focused = it.hasFocus }
-            .clip(shape)
-            .background(if (focused) Color(0xFF22545B) else Color(0xFF142737))
-            .border(if (focused) 2.dp else 1.dp,
-                if (focused) Color(0xFF66E4C9) else Color(0xFF1C3848), shape)
-            .padding(9.dp)) {
-            Box(Modifier.fillMaxWidth().height(92.dp)
-                .clip(RoundedCornerShape(9.dp))
-                .clickable(onClick = onClick).focusable()) {
-                NasThumbnailPreview(entry, Modifier.fillMaxSize())
+        val scale by animateFloatAsState(
+            if (focused) 1.018f else 1f,
+            animationSpec = tween(durationMillis = 180),
+            label = "nasTileFocus"
+        )
+        val shape = RoundedCornerShape(14.dp)
+        Column(
+            Modifier.onFocusChanged { focused = it.hasFocus }
+                .zIndex(if (focused) 1f else 0f)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clip(shape)
+                .background(if (focused) Color(0xFF22545B) else Color(0xFF142737))
+                .border(
+                    if (focused) 2.dp else 1.dp,
+                    if (focused) Color(0xFF66E4C9) else Color(0xFF1C3848), shape
+                )
+                .padding(8.dp)
+        ) {
+            Box(
+                Modifier.fillMaxWidth()
+                    .height(if (large) 151.dp else 115.dp)
+                    .clip(RoundedCornerShape(11.dp))
+            ) {
+                // The preview receives its own OK action, separate from the options button.
+                Box(
+                    Modifier.fillMaxSize()
+                        .clickable(onClick = onClick).focusable()
+                ) {
+                    NasThumbnailPreview(entry, Modifier.fillMaxSize())
+                }
+                TileOptionsButton(
+                    onManage,
+                    Modifier.align(Alignment.TopEnd).padding(6.dp),
+                    "Opcje: ${entry.name}"
+                )
             }
             Spacer(Modifier.height(8.dp))
-            Text(entry.name, color = Color.White, fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold, maxLines = 2,
-                overflow = TextOverflow.Ellipsis, modifier = Modifier.height(34.dp))
-            Text(fileDetails(entry), color = Color(0xFF9BB2C1),
-                fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Spacer(Modifier.height(7.dp))
-            TvButton("Opcje", NasGlyph.INFO, onClick = onManage)
+            Text(
+                entry.name, color = Color.White,
+                fontSize = if (large) 14.sp else 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                fileDetails(entry), color = Color(0xFF9BB2C1),
+                fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+
+    @Composable
+    private fun TileOptionsButton(
+        onClick: () -> Unit,
+        modifier: Modifier = Modifier,
+        description: String
+    ) {
+        var focused by remember { mutableStateOf(false) }
+        val focusScale by animateFloatAsState(
+            if (focused) 1.05f else 1f,
+            animationSpec = tween(durationMillis = 140),
+            label = "nasTileOptionsFocus"
+        )
+        Box(
+            modifier.onFocusChanged { focused = it.isFocused }
+                .zIndex(2f)
+                .graphicsLayer { scaleX = focusScale; scaleY = focusScale }
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (focused) Color(0xFF66E4C9) else Color(0xDB071821))
+                .border(if (focused) 2.dp else 0.dp, Color.White,
+                    RoundedCornerShape(10.dp))
+                .clickable(onClick = onClick)
+                .semantics { contentDescription = description }
+                .focusable()
+                .size(36.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            NasIcon(NasGlyph.INFO, Modifier.size(21.dp),
+                if (focused) Color(0xFF071821) else Color.White)
         }
     }
 
