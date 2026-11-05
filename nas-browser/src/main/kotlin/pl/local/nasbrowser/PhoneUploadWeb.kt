@@ -2,13 +2,17 @@ package pl.local.nasbrowser
 
 /** Responsive standalone LAN page. Dynamic data only enters HTML through escaped placeholders;
  * file/folder names from the API are assigned with textContent (never innerHTML). */
-internal fun renderPhonePage(status: String, paired: Boolean, csrf: String): String {
+internal fun renderPhonePage(status: String, paired: Boolean, csrf: String, note: String?): String {
     return PHONE_HTML
         .replace("__DISK_STATUS__", status)
         .replace("__PAIRED__", if (paired) "true" else "false")
         .replace("__CSRF__", csrf)
         .replace("__AUTH_HINT__", if (paired) "Sparowany telefon" else "Wpisz kod z telewizora")
+        .replace("__MESSAGE__", htmlEscapePhone(note ?: "Wybierz pliki, aby rozpocząć."))
 }
+
+private fun htmlEscapePhone(text: String): String = text.replace("&", "&amp;")
+    .replace("<", "&lt;").replace(">", "&gt;").replace("\\"", "&quot;")
 
 private val PHONE_HTML = """<!doctype html>
 <html lang="pl">
@@ -83,7 +87,7 @@ button[disabled]{opacity:.5;cursor:not-allowed}
 <div id="codeArea" style="display:none"><label for="code">Awaryjny kod z ekranu TV</label><input id="code" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off"></div>
 <button class="primary" id="send" type="button">Wyślij na dysk</button>
 <div class="progress" role="progressbar" aria-label="Postęp wysyłania"><div id="bar"></div></div>
-<div class="messages" id="message" role="status" aria-live="polite">Wybierz pliki, aby rozpocząć.</div>
+<div class="messages message" id="message" role="status" aria-live="polite">__MESSAGE__</div>
 <p class="note">Nie odłączaj dysku USB podczas przesyłania. Połączenie działa w Twojej sieci lokalnej.</p>
 </section>
 <section class="card">
