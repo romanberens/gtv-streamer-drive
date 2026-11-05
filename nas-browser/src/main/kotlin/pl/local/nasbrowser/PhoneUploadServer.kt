@@ -10,20 +10,45 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.Collections
-import kotlin.random.Random
+import org.json.JSONArray
+import org.json.JSONObject
 
 data class UploadDestination(val treeUri: Uri, val rootDocumentId: String, val title: String, val writable: Boolean, val freeBytes: Long)
+
+data class RecentTransfer(val name: String, val size: Long, val timestamp: Long)
 
 class PhoneUploadServer(private val context: Context, private val onUploaded: (String) -> Unit) : NanoHTTPD(PORT) {
     private val prefs = context.getSharedPreferences("phone_upload", Context.MODE_PRIVATE)
     @Volatile private var pairingToken: String? = null
     @Volatile private var pairingExpiresAt: Long = 0
     @Volatile var destination: UploadDestination? = null
+    @Volatile var onScreenRefresh: (() -> Unit)? = null
     val accessCode: String = context.getSharedPreferences("phone_upload", Context.MODE_PRIVATE).getString("code", null)
-        ?: Random.nextInt(100_000, 1_000_000).toString().also { context.getSharedPreferences("phone_upload", Context.MODE_PRIVATE).edit().putString("code", it).apply() }
+        ?: (SecureRandom().nextInt(900_000) + 100_000).toString().also { context.getSharedPreferences("phone_upload", Context.MODE_PRIVATE).edit().putString("code", it).apply() }
     val address: String get() = "http://${localIpv4()}:$PORT"
     val pairingUrl: String? get() = pairingToken?.takeIf { System.currentTimeMillis() < pairingExpiresAt }?.let { "$address/pair?token=$it" }
     val pairedCount: Int get() = prefs.getStringSet("paired_tokens", emptySet()).orEmpty().size
+
+    val recentTransfers: List<RecentTransfer> get() = runCatching {
+        val stored = JSONArray(prefs.getString("recent_transfers", "[]"))
+        (0 until minOf(stored.length(), 5)).map { index ->
+            val entry = stored.getJSONObject(index)
+            RecentTransfer(entry.getString("name"), entry.getLong("size"), entry.getLong("timestamp"))
+        }
+    }.getOrDefault(emptyList())
+
+    private fun recordTransfer(name: String, size: Long) {
+        runCatching {
+            val history = JSONArray(prefs.getString("recent_transfers", "[]"))
+            val updated = JSONArray()
+            updated.put(JSONObject().put("name", name).put("size", size)
+                .put("timestamp", System.currentTimeMillis()))
+            for (index in 0 until minOf(history.length(), 4)) {
+                updated.put(history.getJSONObject(index))
+            }
+            prefs.edit().putString("recent_transfers", updated.toString()).apply()
+        }
+    }
 
     fun beginPairing(): String {
         pairingToken = randomToken(24)
@@ -58,7 +83,9 @@ class PhoneUploadServer(private val context: Context, private val onUploaded: (S
                 runCatching { DocumentsContract.deleteDocument(context.contentResolver, created) }
                 throw error
             }
+            recordTransfer(name, source.length())
             onUploaded(name)
+            onScreenRefresh?.invoke()
             page("Zapisano na ${escape(target.title)}: ${escape(name)}", paired)
         } catch (error: Exception) { page("Błąd zapisu na dysku: ${escape(error.message ?: "nieznany")}", isPaired(session)) }
     }
@@ -74,6 +101,7 @@ class PhoneUploadServer(private val context: Context, private val onUploaded: (S
         prefs.edit().putStringSet("paired_tokens", hashes).apply()
         val response = htmlPage("Telefon został sparowany. Możesz teraz wysyłać pliki bez wpisywania kodu.<br><br><a href='/'>Otwórz dysk domowy</a>")
         response.addHeader("Set-Cookie", "nas_device=$deviceToken; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000")
+        onScreenRefresh?.invoke()
         return response
     }
 
