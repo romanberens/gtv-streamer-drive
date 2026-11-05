@@ -23,6 +23,15 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.layout.ContentScale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -86,6 +95,38 @@ class MainActivity : ComponentActivity() {
         var current by remember { mutableStateOf<BrowserLocation?>(null) }
         var stack by remember { mutableStateOf(emptyList<BrowserLocation>()) }
         var pairingUrl by remember { mutableStateOf<String?>(null) }
+        var gridView by remember { mutableStateOf(false) }
+        var selected by remember { mutableStateOf<StorageEntry?>(null) }
+        var nameDialog by remember { mutableStateOf<String?>(null) }
+        var inputName by remember { mutableStateOf("") }
+        var confirmDelete by remember { mutableStateOf(false) }
+        var pasteItem by remember { mutableStateOf<StorageEntry?>(null) }
+        var pasteMove by remember { mutableStateOf(false) }
+        var busy by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+        val storageOps = remember(activeRoot?.documentId, activeRoot?.writable) {
+            activeRoot?.let { NasStorageOps(this@MainActivity, it.documentId, it.writable) }
+        }
+
+        fun perform(success: String, operation: () -> Unit, after: () -> Unit = {}) {
+            if (busy) return
+            busy = true
+            scope.launch {
+                val result = withContext(Dispatchers.IO) { runCatching { operation() } }
+                busy = false
+                Toast.makeText(
+                    this@MainActivity,
+                    if (result.isSuccess) success else "Błąd: " +
+                        (result.exceptionOrNull()?.message ?: "operacja nie powiodła się"),
+                    Toast.LENGTH_LONG
+                ).show()
+                if (result.isSuccess) {
+                    refreshTick++
+                    selected = null
+                    after()
+                }
+            }
+        }
 
         // A refresh after an upload must not jump back to the USB root directory.
         LaunchedEffect(activeRoot?.documentId) {
@@ -99,12 +140,17 @@ class MainActivity : ComponentActivity() {
             else loadChildren(activeRoot.documentId, location.documentId)
         }
 
-        BackHandler(enabled = pairingUrl != null || stack.isNotEmpty()) {
-            if (pairingUrl != null) {
-                pairingUrl = null
-            } else {
-                current = stack.last()
-                stack = stack.dropLast(1)
+        BackHandler(
+            enabled = nameDialog == null && !confirmDelete && selected == null &&
+                (pairingUrl != null || stack.isNotEmpty() || pasteItem != null)
+        ) {
+            when {
+                pairingUrl != null -> pairingUrl = null
+                stack.isNotEmpty() -> {
+                    current = stack.last()
+                    stack = stack.dropLast(1)
+                }
+                pasteItem != null -> pasteItem = null
             }
         }
 
@@ -231,14 +277,54 @@ class MainActivity : ComponentActivity() {
                                         maxLines = 1, overflow = TextOverflow.Ellipsis
                                     )
                                 }
+                                TvButton(
+                                    if (gridView) "Lista" else "Miniatury",
+                                    if (gridView) NasGlyph.DOCUMENT else NasGlyph.IMAGE
+                                ) { gridView = !gridView }
                                 if (stack.isNotEmpty()) {
+                                    Spacer(Modifier.width(8.dp))
                                     TvButton("Wstecz", NasGlyph.BACK) {
                                         current = stack.last()
                                         stack = stack.dropLast(1)
                                     }
                                 }
                             }
-                            Spacer(Modifier.height(12.dp))
+                            Spacer(Modifier.height(10.dp))
+                            if (activeRoot != null) {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    TvButton("Nowy folder", NasGlyph.FOLDER) {
+                                        inputName = ""
+                                        nameDialog = "new"
+                                    }
+                                    val pending = pasteItem
+                                    if (pending != null) {
+                                        TvButton(
+                                            if (pasteMove) "Przenieś tutaj" else "Kopiuj tutaj",
+                                            NasGlyph.UPLOAD
+                                        ) {
+                                            if (storageOps != null && location != null) {
+                                                perform(
+                                                    if (pasteMove) "Plik przeniesiony" else "Plik skopiowany",
+                                                    { storageOps.copyOrMoveFile(
+                                                        pending.documentId, location.documentId, pasteMove
+                                                    ) },
+                                                    after = { pasteItem = null }
+                                                )
+                                            }
+                                        }
+                                        TvButton("Anuluj", NasGlyph.BACK) { pasteItem = null }
+                                    }
+                                }
+                                Spacer(Modifier.height(10.dp))
+                            }
+                            if (busy) {
+                                Text("Trwa operacja na dysku…", color = Color(0xFF66E4C9),
+                                    fontSize = 12.sp)
+                            }
                             if (activeRoot == null) {
                                 EmptyState(NasGlyph.USB, "Dysk USB nie jest dostępny",
                                     "Sprawdź zasilanie, kabel i uprawnienia aplikacji NTFS.") {
@@ -248,16 +334,30 @@ class MainActivity : ComponentActivity() {
                                 EmptyState(NasGlyph.FOLDER, "Brak plików w tym folderze",
                                     "Folder jest pusty lub odczyt nie powiódł się.") { refreshTick++ }
                             } else {
-                                LazyColumn(
-                                    verticalArrangement = Arrangement.spacedBy(7.dp),
-                                    contentPadding = PaddingValues(bottom = 24.dp)
-                                ) {
-                                    items(entries, key = { it.documentId }) { entry ->
-                                        FileRow(entry) {
-                                            if (entry.isDirectory) {
-                                                location?.let { stack = stack + it }
-                                                current = BrowserLocation(entry.documentId, entry.name)
-                                            } else openFile(entry)
+                                val openEntry: (StorageEntry) -> Unit = { entry ->
+                                    if (entry.isDirectory) {
+                                        location?.let { stack = stack + it }
+                                        current = BrowserLocation(entry.documentId, entry.name)
+                                    } else openFile(entry)
+                                }
+                                if (gridView) {
+                                    LazyVerticalGrid(
+                                        columns = GridCells.Adaptive(minSize = 146.dp),
+                                        verticalArrangement = Arrangement.spacedBy(9.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                                        contentPadding = PaddingValues(bottom = 28.dp)
+                                    ) {
+                                        gridItems(entries, key = { it.documentId }) { entry ->
+                                            FileTile(entry, { openEntry(entry) }, { selected = entry })
+                                        }
+                                    }
+                                } else {
+                                    LazyColumn(
+                                        verticalArrangement = Arrangement.spacedBy(7.dp),
+                                        contentPadding = PaddingValues(bottom = 24.dp)
+                                    ) {
+                                        items(entries, key = { it.documentId }) { entry ->
+                                            FileRow(entry, { openEntry(entry) }, { selected = entry })
                                         }
                                     }
                                 }
@@ -336,6 +436,105 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // TV remote-accessible item menu. Nothing destructive happens without confirmation.
+        selected?.let { entry ->
+            Dialog(onDismissRequest = { selected = null }) {
+                Column(Modifier.width(390.dp)
+                    .background(Color(0xFF142737), RoundedCornerShape(19.dp))
+                    .padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(entry.name, color = Color.White, fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold, maxLines = 2,
+                        overflow = TextOverflow.Ellipsis)
+                    Text(if (entry.isDirectory) "Katalog" else fileDetails(entry),
+                        color = Color(0xFF9BB2C1), fontSize = 13.sp)
+                    if (activeRoot?.writable == true) {
+                        TvButton("Zmień nazwę", NasGlyph.DOCUMENT) {
+                            inputName = entry.name
+                            nameDialog = "rename"
+                        }
+                        if (!entry.isDirectory) {
+                            TvButton("Kopiuj do…", NasGlyph.DOCUMENT) {
+                                pasteItem = entry
+                                pasteMove = false
+                                selected = null
+                            }
+                            TvButton("Przenieś do…", NasGlyph.UPLOAD) {
+                                pasteItem = entry
+                                pasteMove = true
+                                selected = null
+                            }
+                        }
+                        TvButton("Usuń", NasGlyph.INFO) { confirmDelete = true }
+                    } else {
+                        Text("Dysk tylko do odczytu", color = Color(0xFFFFB7A5))
+                    }
+                    TvButton("Zamknij", NasGlyph.BACK) { selected = null }
+                }
+            }
+        }
+
+        if (nameDialog != null) {
+            val mode = nameDialog
+            val entry = selected
+            Dialog(onDismissRequest = { nameDialog = null }) {
+                Column(Modifier.width(400.dp)
+                    .background(Color(0xFF142737), RoundedCornerShape(18.dp))
+                    .padding(24.dp), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+                    Text(if (mode == "new") "Nowy katalog" else "Zmień nazwę",
+                        color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    OutlinedTextField(
+                        value = inputName,
+                        onValueChange = { inputName = it },
+                        label = { Text("Nazwa") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    TvButton("Zapisz", NasGlyph.CHECK) {
+                        val ops = storageOps
+                        val destination = location
+                        val value = inputName
+                        if (ops != null && destination != null) {
+                            if (mode == "new") {
+                                perform("Katalog utworzony", {
+                                    ops.createFolder(destination.documentId, value)
+                                })
+                            } else if (entry != null) {
+                                perform("Zmieniono nazwę", { ops.rename(entry.documentId, value) })
+                            }
+                            nameDialog = null
+                        }
+                    }
+                    TvButton("Anuluj", NasGlyph.BACK) { nameDialog = null }
+                }
+            }
+        }
+
+        if (confirmDelete && selected != null) {
+            val entry = selected!!
+            Dialog(onDismissRequest = { confirmDelete = false }) {
+                Column(Modifier.width(410.dp)
+                    .background(Color(0xFF142737), RoundedCornerShape(18.dp))
+                    .padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text("Usunąć na stałe?", color = Color(0xFFFFB7A5),
+                        fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                    Text(entry.name, color = Color.White, fontSize = 17.sp)
+                    Text(
+                        if (entry.isDirectory)
+                            "Uwaga: usuwanie katalogu może usunąć całą jego zawartość. Brak kosza."
+                        else "Nie można cofnąć tej operacji. Brak kosza.",
+                        color = Color(0xFF9BB2C1), fontSize = 13.sp
+                    )
+                    TvButton("Tak, usuń", NasGlyph.INFO) {
+                        storageOps?.let { ops ->
+                            perform("Usunięto element", { ops.delete(entry.documentId) })
+                        }
+                        confirmDelete = false
+                    }
+                    TvButton("Zachowaj", NasGlyph.BACK) { confirmDelete = false }
                 }
             }
         }
@@ -473,7 +672,9 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun FileRow(entry: StorageEntry, onClick: () -> Unit) {
+    private fun FileRow(
+        entry: StorageEntry, onClick: () -> Unit, onManage: () -> Unit
+    ) {
         var focused by remember { mutableStateOf(false) }
         val shape = RoundedCornerShape(12.dp)
         val glyph = when {
@@ -514,12 +715,35 @@ class MainActivity : ComponentActivity() {
                 Text(fileDetails(entry), color = Color(0xFF9BB2C1),
                     fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (entry.isDirectory) {
-                Text("›", color = if (focused) Color.White else Color(0xFF66E4C9),
-                    fontSize = 23.sp, fontWeight = FontWeight.Bold)
-            } else {
-                NasIcon(NasGlyph.INFO, Modifier.size(17.dp), Color(0xFF89A9B9))
+            TvButton("Opcje", NasGlyph.INFO, onClick = onManage)
+        }
+    }
+
+    @Composable
+    private fun FileTile(
+        entry: StorageEntry, onClick: () -> Unit, onManage: () -> Unit
+    ) {
+        var focused by remember { mutableStateOf(false) }
+        val shape = RoundedCornerShape(13.dp)
+        Column(Modifier.onFocusChanged { focused = it.hasFocus }
+            .clip(shape)
+            .background(if (focused) Color(0xFF22545B) else Color(0xFF142737))
+            .border(if (focused) 2.dp else 1.dp,
+                if (focused) Color(0xFF66E4C9) else Color(0xFF1C3848), shape)
+            .padding(9.dp)) {
+            Box(Modifier.fillMaxWidth().height(92.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .clickable(onClick = onClick).focusable()) {
+                NasThumbnailPreview(entry, Modifier.fillMaxSize())
             }
+            Spacer(Modifier.height(8.dp))
+            Text(entry.name, color = Color.White, fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold, maxLines = 2,
+                overflow = TextOverflow.Ellipsis, modifier = Modifier.height(34.dp))
+            Text(fileDetails(entry), color = Color(0xFF9BB2C1),
+                fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(7.dp))
+            TvButton("Opcje", NasGlyph.INFO, onClick = onManage)
         }
     }
 
