@@ -38,11 +38,11 @@ internal fun NasIcon(
                 drawRoundRect(tint, Offset(x, y), Size(w, h), CornerRadius(radius), style = outline)
             fun dot(x: Float, y: Float, radius: Float = 1.25f) =
                 drawCircle(tint, radius, Offset(x, y))
-            fun path(vararg points: Pair<Float, Float>, close: Boolean = false) {
+            fun path(vararg points: Pair<Float, Float>, closed: Boolean = false) {
                 val p = Path().apply {
                     points.firstOrNull()?.let { moveTo(it.first, it.second) }
                     points.drop(1).forEach { lineTo(it.first, it.second) }
-                    if (close) close()
+                    if (closed) close()
                 }
                 drawPath(p, tint, style = outline)
             }
@@ -110,7 +110,7 @@ internal fun NasIcon(
                 }
                 NasGlyph.VIDEO -> {
                     rect(2.8f, 5f, 18.4f, 14f, 2.3f)
-                    path(10f to 9f, 16f to 12f, 10f to 15f, close = true)
+                    path(10f to 9f, 16f to 12f, 10f to 15f, closed = true)
                 }
                 NasGlyph.AUDIO -> {
                     line(15f, 4f, 15f, 17f)
@@ -125,7 +125,7 @@ internal fun NasIcon(
                     path(4f to 18f, 10f to 12f, 13f to 15f, 16f to 11f, 20f to 16f)
                 }
                 NasGlyph.DOCUMENT -> {
-                    path(5f to 2f, 15f to 2f, 20f to 7f, 20f to 22f, 5f to 22f, close = true)
+                    path(5f to 2f, 15f to 2f, 20f to 7f, 20f to 22f, 5f to 22f, closed = true)
                     path(15f to 2f, 15f to 7f, 20f to 7f)
                     line(8f, 12f, 17f, 12f)
                     line(8f, 16f, 17f, 16f)
