@@ -61,7 +61,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val serviceIntent = Intent(this, UploadServerService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent) else startService(serviceIntent)
-        uploadServer = UploadServerRuntime.get(this) { runOnUiThread { refreshTick++ } }
+        uploadServer = UploadServerRuntime.get(this)
+        uploadServer.onScreenRefresh = { runOnUiThread { refreshTick++ } }
         setContent { BrowserApp() }
     }
 
@@ -70,62 +71,205 @@ class MainActivity : ComponentActivity() {
         refreshTick++
     }
 
+
+    override fun onDestroy() {
+        if (::uploadServer.isInitialized) uploadServer.onScreenRefresh = null
+        super.onDestroy()
+    }
+
     @Composable
     private fun BrowserApp() {
         val roots = remember(refreshTick) { loadRoots() }
-        var current by remember(roots) { mutableStateOf(roots.firstOrNull()?.let { BrowserLocation(it.documentId, it.title) }) }
-        var stack by remember(roots) { mutableStateOf(emptyList<BrowserLocation>()) }
+        val activeRoot = roots.firstOrNull()
+        var current by remember { mutableStateOf<BrowserLocation?>(null) }
+        var stack by remember { mutableStateOf(emptyList<BrowserLocation>()) }
         var pairingUrl by remember { mutableStateOf<String?>(null) }
 
+        // A refresh after an upload must not jump back to the USB root directory.
+        LaunchedEffect(activeRoot?.documentId) {
+            current = activeRoot?.let { BrowserLocation(it.documentId, it.title) }
+            stack = emptyList()
+        }
+
+        val location = current ?: activeRoot?.let { BrowserLocation(it.documentId, it.title) }
+        val entries = remember(activeRoot?.documentId, location?.documentId, refreshTick) {
+            if (activeRoot == null || location == null) emptyList()
+            else loadChildren(activeRoot.documentId, location.documentId)
+        }
+
         BackHandler(enabled = pairingUrl != null || stack.isNotEmpty()) {
-            if (pairingUrl != null) pairingUrl = null else {
+            if (pairingUrl != null) {
+                pairingUrl = null
+            } else {
                 current = stack.last()
                 stack = stack.dropLast(1)
             }
         }
 
         MaterialTheme {
-            Column(Modifier.fillMaxSize().background(Color(0xFF07131F)).padding(48.dp)) {
+            Column(Modifier.fillMaxSize().background(Color(0xFF08131D))
+                .padding(horizontal = 30.dp, vertical = 22.dp)) {
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(48.dp).background(Color(0xFF65DEC5),
+                        RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
+                        Text("▤", fontSize = 29.sp, color = Color(0xFF08131D),
+                            fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.width(15.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Panel NAS", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                        Text(current?.title ?: "Dysk NTFS nie jest jeszcze udostępniony", color = Color(0xFF9FB3C8), fontSize = 16.sp)
-                        Text("Google TV Streamer · ${uploadServer.address}", color = Color(0xFF72D5C3), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        Text("Panel NAS", color = Color.White, fontSize = 29.sp,
+                            fontWeight = FontWeight.Bold)
+                        Text("Dysk lokalny  •  Pliki  •  Transfer Wi-Fi",
+                            color = Color(0xFFAAC0CB), fontSize = 13.sp)
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        TvButton("Sparuj telefon") { pairingUrl = uploadServer.beginPairing() }
-                        TvButton(if (roots.isEmpty()) "Podłącz dysk NTFS" else "Odśwież") {
-                            if (roots.isEmpty()) launchBackend() else refreshTick++
-                        }
-                    }
+                    Text("●  Google TV Streamer", color = Color(0xFF65DEC5), fontSize = 13.sp)
+                    Spacer(Modifier.width(20.dp))
+                    Text("v0.2 beta", color = Color(0xFFAAC0CB), fontSize = 12.sp)
                 }
-                Spacer(Modifier.height(22.dp))
-                val activeRoot = roots.firstOrNull()
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                    StatusCard("DYSK USB", activeRoot?.filesystem?.ifBlank { "NTFS" } ?: "Niepodłączony", activeRoot?.let { formatSize(it.freeBytes) + " wolne" } ?: "Sprawdź połączenie", activeRoot != null, Modifier.weight(1f))
-                    StatusCard("ZAPIS", if (activeRoot?.writable == true) "Odczyt i zapis" else "Tylko odczyt", if (activeRoot?.writable == true) "Telefon → dysk" else "Wymagany chkdsk /f", activeRoot?.writable == true, Modifier.weight(1f))
-                    StatusCard("TELEFONY", "${uploadServer.pairedCount} sparowanych", "Awaryjny kod ${uploadServer.accessCode}", true, Modifier.weight(1f))
+
+                Spacer(Modifier.height(18.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    StatusCard("DYSK USB",
+                        activeRoot?.filesystem?.ifBlank { "NTFS" } ?: "Niepodłączony",
+                        activeRoot?.title ?: "Uruchom obsługę USB",
+                        activeRoot != null, Modifier.weight(1f))
+                    StatusCard("WOLNE MIEJSCE",
+                        activeRoot?.let { formatSize(it.freeBytes) } ?: "—",
+                        "Dostępne na dysku", activeRoot != null, Modifier.weight(1f))
+                    StatusCard("ZAPIS",
+                        if (activeRoot?.writable == true) "Odczyt i zapis" else "Niedostępny",
+                        if (activeRoot?.writable == true) "Telefon → USB" else "Sprawdź dostęp",
+                        activeRoot?.writable == true, Modifier.weight(1f))
+                    StatusCard("TELEFONY", uploadServer.pairedCount.toString() + " sparowanych",
+                        "Transfer w sieci LAN", true, Modifier.weight(1f))
                 }
-                Spacer(Modifier.height(22.dp))
+
+                Spacer(Modifier.height(18.dp))
                 if (pairingUrl != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Parowanie telefonu", color = Color.White, fontSize = 23.sp,
+                            fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        TvButton("Wróć do plików") { pairingUrl = null }
+                    }
+                    Spacer(Modifier.height(12.dp))
                     PairingPanel(pairingUrl!!)
                 } else {
-                    Text("PLIKI NA DYSKU", color = Color(0xFF9FB3C8), fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(10.dp))
-                    val location = current
-                    if (location == null) {
-                        EmptyState("Uruchom obsługę NTFS i zaakceptuj dostęp do urządzenia USB.")
-                    } else {
-                        val entries = remember(location.documentId, refreshTick) { loadChildren(location.documentId) }
-                        if (entries.isEmpty()) EmptyState("Ten folder jest pusty") else LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 32.dp)
-                        ) {
-                            items(entries, key = { it.documentId }) { entry ->
-                                FileRow(entry) {
-                                    if (entry.isDirectory) {
-                                        stack = stack + location
-                                        current = BrowserLocation(entry.documentId, entry.name)
-                                    } else openFile(entry)
+                    Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Column(Modifier.width(174.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("MENU", color = Color(0xFFAAC0CB), fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold)
+                            SideNav("▤  Przeglądaj", true) { }
+                            SideNav("▣  Sparuj telefon", false) {
+                                pairingUrl = uploadServer.beginPairing()
+                            }
+                            SideNav("↻  Odśwież", false) { refreshTick++ }
+                            SideNav("◉  Obsługa USB", false) { launchBackend() }
+                            Spacer(Modifier.height(12.dp))
+                            Column(Modifier.fillMaxWidth()
+                                .background(Color(0xFF122332), RoundedCornerShape(12.dp))
+                                .padding(14.dp)) {
+                                Text("LOKALNA SIEĆ", color = Color(0xFFAAC0CB),
+                                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.height(7.dp))
+                                Text(uploadServer.address, color = Color(0xFF65DEC5),
+                                    fontSize = 12.sp, maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+
+                        Column(Modifier.weight(1f).fillMaxHeight()) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Przeglądarka plików", color = Color.White,
+                                        fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                                    Text(location?.title ?: "Brak dysku", color = Color(0xFFAAC0CB),
+                                        fontSize = 13.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis)
+                                }
+                                if (stack.isNotEmpty()) TvButton("← Wstecz") {
+                                    current = stack.last()
+                                    stack = stack.dropLast(1)
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            if (activeRoot == null) {
+                                Column(Modifier.fillMaxSize()
+                                    .background(Color(0xFF122332), RoundedCornerShape(13.dp))
+                                    .padding(20.dp),
+                                    verticalArrangement = Arrangement.Center,
+                                    horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text("Dysk USB nie jest dostępny", color = Color.White,
+                                        fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.height(10.dp))
+                                    Text("Otwórz backend i zaakceptuj dostęp do urządzenia USB.",
+                                        color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                                    Spacer(Modifier.height(15.dp))
+                                    TvButton("Otwórz obsługę USB") { launchBackend() }
+                                }
+                            } else if (entries.isEmpty()) {
+                                EmptyState("Folder jest pusty lub nie udało się odczytać plików.")
+                            } else {
+                                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    contentPadding = PaddingValues(bottom = 22.dp)) {
+                                    items(entries, key = { it.documentId }) { entry ->
+                                        FileRow(entry) {
+                                            if (entry.isDirectory) {
+                                                location?.let { stack = stack + it }
+                                                current = BrowserLocation(entry.documentId, entry.name)
+                                            } else openFile(entry)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Column(Modifier.width(258.dp).fillMaxHeight(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Column(Modifier.fillMaxWidth()
+                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
+                                .padding(16.dp)) {
+                                Text("Sparuj telefon", color = Color.White,
+                                    fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.height(6.dp))
+                                Text("Wyślij plik bezpośrednio na dysk USB z telefonu.",
+                                    color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                                Spacer(Modifier.height(13.dp))
+                                TvButton("Pokaż kod QR") {
+                                    pairingUrl = uploadServer.beginPairing()
+                                }
+                            }
+                            Column(Modifier.fillMaxWidth().weight(1f)
+                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
+                                .padding(16.dp)) {
+                                Text("Ostatnie transfery", color = Color.White,
+                                    fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.height(12.dp))
+                                val history = remember(refreshTick) { uploadServer.recentTransfers }
+                                if (history.isEmpty()) {
+                                    Text("Nie przesłano jeszcze żadnych plików.",
+                                        color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                                } else {
+                                    history.take(4).forEach { transfer ->
+                                        Text("✓  " + transfer.name, color = Color.White,
+                                            fontSize = 13.sp, maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis)
+                                        Text(formatSize(transfer.size),
+                                            color = Color(0xFF65DEC5), fontSize = 11.sp)
+                                        Spacer(Modifier.height(12.dp))
+                                    }
+                                }
+                            }
+                            Column(Modifier.fillMaxWidth()
+                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
+                                .padding(16.dp)) {
+                                Text("KOD AWARYJNY", color = Color(0xFFAAC0CB),
+                                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Text(uploadServer.accessCode, color = Color(0xFF65DEC5),
+                                    fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                                Text("Widoczny na telewizorze", color = Color(0xFFAAC0CB),
+                                    fontSize = 11.sp)
                             }
                         }
                     }
@@ -133,6 +277,21 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    @Composable
+    private fun SideNav(label: String, active: Boolean, onClick: () -> Unit) {
+        var focused by remember { mutableStateOf(false) }
+        val shape = RoundedCornerShape(11.dp)
+        val highlighted = focused || active
+        Box(Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }
+            .clip(shape)
+            .background(if (highlighted) Color(0xFF65DEC5) else Color(0xFF182D3C))
+            .border(if (focused) 2.dp else 0.dp, if (focused) Color.White else Color.Transparent, shape)
+            .clickable(onClick = onClick).focusable()
+            .padding(horizontal = 13.dp, vertical = 15.dp)) {
+            Text(label, color = if (highlighted) Color(0xFF08131D) else Color.White,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        }
     }
 
     private fun loadRoots(): List<StorageRoot> = runCatching {
@@ -148,16 +307,17 @@ class MainActivity : ComponentActivity() {
         }
     }.getOrDefault(emptyList())
 
-    private fun loadChildren(documentId: String): List<StorageEntry> = runCatching {
+    private fun loadChildren(rootDocumentId: String, documentId: String): List<StorageEntry> = runCatching {
         contentResolver.query(
-            DocumentsContract.buildChildDocumentsUriUsingTree(DocumentsContract.buildTreeDocumentUri(AUTHORITY, documentId), documentId),
+            DocumentsContract.buildChildDocumentsUriUsingTree(DocumentsContract.buildTreeDocumentUri(AUTHORITY, rootDocumentId), documentId),
             arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE, Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED),
             null, null, null
         )?.use { cursor ->
             buildList {
                 while (cursor.moveToNext()) add(StorageEntry(
                     cursor.text(Document.COLUMN_DOCUMENT_ID), cursor.text(Document.COLUMN_DISPLAY_NAME),
-                    cursor.text(Document.COLUMN_MIME_TYPE), cursor.long(Document.COLUMN_SIZE), cursor.long(Document.COLUMN_LAST_MODIFIED)
+                    cursor.text(Document.COLUMN_MIME_TYPE), cursor.long(Document.COLUMN_SIZE), cursor.long(Document.COLUMN_LAST_MODIFIED),
+                    DocumentsContract.buildDocumentUriUsingTree(DocumentsContract.buildTreeDocumentUri(AUTHORITY, rootDocumentId), cursor.text(Document.COLUMN_DOCUMENT_ID))
                 ))
             }.sortedWith(compareByDescending<StorageEntry> { it.isDirectory }.thenBy { it.name.lowercase() })
         }.orEmpty()
