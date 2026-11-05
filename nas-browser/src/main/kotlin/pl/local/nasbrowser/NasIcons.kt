@@ -18,7 +18,7 @@ import androidx.compose.ui.unit.dp
 /** Small, resolution-independent icons. No emoji fonts or extended icon dependency. */
 internal enum class NasGlyph {
     LOGO, DRIVE, FOLDER, PHONE, WIFI, REFRESH, USB, UPLOAD,
-    VIDEO, AUDIO, IMAGE, DOCUMENT, USERS, BACK, CHECK, QR, CLOCK, INFO
+    VIDEO, AUDIO, IMAGE, DOCUMENT, USERS, BACK, CHECK, QR, CLOCK, INFO, PANEL
 }
 
 @Composable
@@ -163,6 +163,11 @@ internal fun NasIcon(
                     drawCircle(tint, 9f, Offset(12f, 12f), style = outline)
                     dot(12f, 7.2f)
                     line(12f, 11f, 12f, 17f)
+                }
+                NasGlyph.PANEL -> {
+                    rect(2.5f, 3.5f, 19f, 17f, 2f)
+                    line(9f, 3.5f, 9f, 20.5f)
+                    path(15f to 9f, 18f to 12f, 15f to 15f)
                 }
             }
         }
