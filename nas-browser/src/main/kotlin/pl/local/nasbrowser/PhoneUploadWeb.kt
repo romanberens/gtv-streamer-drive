@@ -12,7 +12,7 @@ internal fun renderPhonePage(status: String, paired: Boolean, csrf: String, note
 }
 
 private fun htmlEscapePhone(text: String): String = text.replace("&", "&amp;")
-    .replace("<", "&lt;").replace(">", "&gt;").replace("\\"", "&quot;")
+    .replace("<", "&lt;").replace(">", "&gt;").replace(34.toChar().toString(), "&quot;")
 
 private val PHONE_HTML = """<!doctype html>
 <html lang="pl">
