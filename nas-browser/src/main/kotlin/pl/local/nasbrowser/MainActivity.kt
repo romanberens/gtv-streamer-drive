@@ -32,8 +32,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -107,119 +109,149 @@ class MainActivity : ComponentActivity() {
         }
 
         MaterialTheme {
-            Column(Modifier.fillMaxSize().background(Color(0xFF08131D))
-                .padding(horizontal = 30.dp, vertical = 22.dp)) {
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(48.dp).background(Color(0xFF65DEC5),
-                        RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
-                        Text("▤", fontSize = 29.sp, color = Color(0xFF08131D),
-                            fontWeight = FontWeight.Bold)
+            Column(
+                Modifier.fillMaxSize()
+                    .background(Brush.verticalGradient(listOf(Color(0xFF101E2C), Color(0xFF070F19))))
+                    .padding(horizontal = 30.dp, vertical = 22.dp)
+            ) {
+                // Compact header leaves more room for the content on TV displays.
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(51.dp).background(Color(0xFF66E4C9), RoundedCornerShape(15.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        NasIcon(NasGlyph.LOGO, Modifier.size(30.dp), Color(0xFF09202A))
                     }
-                    Spacer(Modifier.width(15.dp))
+                    Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Panel NAS", color = Color.White, fontSize = 29.sp,
+                        Text("Panel NAS", color = Color.White, fontSize = 28.sp,
                             fontWeight = FontWeight.Bold)
-                        Text("Dysk lokalny  •  Pliki  •  Transfer Wi-Fi",
-                            color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                        Text("Twoje pliki i transfer z telefonu • Google TV Streamer",
+                            color = Color(0xFFA7BDCC), fontSize = 12.sp)
                     }
-                    Text("●  Google TV Streamer", color = Color(0xFF65DEC5), fontSize = 13.sp)
-                    Spacer(Modifier.width(20.dp))
-                    Text("v0.2 beta", color = Color(0xFFAAC0CB), fontSize = 12.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.background(Color(0xFF173B3C), RoundedCornerShape(40.dp))
+                            .padding(horizontal = 13.dp, vertical = 8.dp)) {
+                        NasIcon(NasGlyph.WIFI, Modifier.size(17.dp), Color(0xFF66E4C9))
+                        Spacer(Modifier.width(7.dp))
+                        Text("LAN aktywny", color = Color(0xFFCBFFF2),
+                            fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    Text("v0.2.1 • UI", color = Color(0xFF879EAE), fontSize = 12.sp)
                 }
 
                 Spacer(Modifier.height(18.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    StatusCard("DYSK USB",
-                        activeRoot?.filesystem?.ifBlank { "NTFS" } ?: "Niepodłączony",
-                        activeRoot?.title ?: "Uruchom obsługę USB",
+                    StatusCard(NasGlyph.DRIVE, "DYSK USB",
+                        activeRoot?.filesystem?.ifBlank { "NTFS" } ?: "Brak dysku",
+                        activeRoot?.title ?: "Sprawdź połączenie USB",
                         activeRoot != null, Modifier.weight(1f))
-                    StatusCard("WOLNE MIEJSCE",
+                    StatusCard(NasGlyph.DRIVE, "WOLNE MIEJSCE",
                         activeRoot?.let { formatSize(it.freeBytes) } ?: "—",
-                        "Dostępne na dysku", activeRoot != null, Modifier.weight(1f))
-                    StatusCard("ZAPIS",
+                        "Dostępne na nośniku", activeRoot != null, Modifier.weight(1f))
+                    StatusCard(NasGlyph.CHECK, "UPRAWNIENIA",
                         when (activeRoot?.writable) {
                             true -> "Odczyt i zapis"
                             false -> "Tylko odczyt"
                             null -> "Brak dysku"
                         },
-                        if (activeRoot?.writable == true) "Telefon → USB" else "Sprawdź dostęp",
-                        activeRoot?.writable == true, Modifier.weight(1f))
-                    StatusCard("TELEFONY", uploadServer.pairedCount.toString() + " sparowanych",
-                        "Transfer w sieci LAN", true, Modifier.weight(1f))
+                        if (activeRoot?.writable == true) "Transfer na dysk gotowy"
+                        else "Wymaga sprawdzenia", activeRoot?.writable == true, Modifier.weight(1f))
+                    StatusCard(NasGlyph.USERS, "SPAROWANE",
+                        "${uploadServer.pairedCount} telefony",
+                        "Połączenia lokalne", true, Modifier.weight(1f))
                 }
+                Spacer(Modifier.height(17.dp))
 
-                Spacer(Modifier.height(18.dp))
                 if (pairingUrl != null) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Parowanie telefonu", color = Color.White, fontSize = 23.sp,
-                            fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        TvButton("Wróć do plików") { pairingUrl = null }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        NasIcon(NasGlyph.QR, Modifier.size(28.dp), Color(0xFF66E4C9))
+                        Spacer(Modifier.width(12.dp))
+                        Text("Parowanie telefonu", Modifier.weight(1f),
+                            color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                        TvButton("Wróć do plików", NasGlyph.BACK) { pairingUrl = null }
                     }
                     Spacer(Modifier.height(12.dp))
                     PairingPanel(pairingUrl!!)
                 } else {
-                    Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                        Column(Modifier.width(174.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text("MENU", color = Color(0xFFAAC0CB), fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold)
-                            SideNav("▤  Przeglądaj", true) {
+                    Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(15.dp)) {
+                        Column(
+                            Modifier.width(185.dp).fillMaxHeight()
+                                .background(Color(0xFF112232), RoundedCornerShape(16.dp))
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(9.dp)
+                        ) {
+                            Text("NAWIGACJA", color = Color(0xFF849DAF), fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(start = 10.dp, top = 8.dp, bottom = 4.dp))
+                            SideNav(NasGlyph.FOLDER, "Przeglądaj", true) {
                                 current = activeRoot?.let { BrowserLocation(it.documentId, it.title) }
                                 stack = emptyList()
                             }
-                            SideNav("▣  Sparuj telefon", false) {
+                            SideNav(NasGlyph.QR, "Sparuj telefon", false) {
                                 pairingUrl = uploadServer.beginPairing()
                             }
-                            SideNav("↻  Odśwież", false) { refreshTick++ }
-                            SideNav("◉  Obsługa USB", false) { launchBackend() }
-                            Spacer(Modifier.height(12.dp))
+                            SideNav(NasGlyph.REFRESH, "Odśwież", false) { refreshTick++ }
+                            SideNav(NasGlyph.USB, "Obsługa USB", false) { launchBackend() }
+
+                            Spacer(Modifier.weight(1f))
                             Column(Modifier.fillMaxWidth()
-                                .background(Color(0xFF122332), RoundedCornerShape(12.dp))
-                                .padding(14.dp)) {
-                                Text("LOKALNA SIEĆ", color = Color(0xFFAAC0CB),
-                                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                .background(Color(0xFF1B3444), RoundedCornerShape(12.dp))
+                                .padding(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    NasIcon(NasGlyph.WIFI, Modifier.size(17.dp), Color(0xFF66E4C9))
+                                    Spacer(Modifier.width(7.dp))
+                                    Text("ADRES NAS", color = Color(0xFF9FB8C8),
+                                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                }
                                 Spacer(Modifier.height(7.dp))
-                                Text(uploadServer.address, color = Color(0xFF65DEC5),
-                                    fontSize = 12.sp, maxLines = 3,
-                                    overflow = TextOverflow.Ellipsis)
+                                Text(uploadServer.address, color = Color.White, fontSize = 12.sp,
+                                    maxLines = 3, overflow = TextOverflow.Ellipsis)
                             }
+                            Text("Sterowanie: pilot • OK • Wstecz",
+                                color = Color(0xFF829AA9), fontSize = 10.sp,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 5.dp))
                         }
 
                         Column(Modifier.weight(1f).fillMaxHeight()) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text("Przeglądarka plików", color = Color.White,
-                                        fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                                    Text(location?.title ?: "Brak dysku", color = Color(0xFFAAC0CB),
-                                        fontSize = 13.sp, maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        NasIcon(NasGlyph.FOLDER, Modifier.size(23.dp), Color(0xFFFFC777))
+                                        Spacer(Modifier.width(10.dp))
+                                        Text("Pliki na dysku", color = Color.White, fontSize = 22.sp,
+                                            fontWeight = FontWeight.Bold)
+                                    }
+                                    Spacer(Modifier.height(5.dp))
+                                    Text(
+                                        (location?.title ?: "Brak podłączonego dysku") +
+                                            if (activeRoot != null) "  •  ${entries.size} elementów" else "",
+                                        color = Color(0xFF9BB2C1), fontSize = 12.sp,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                                    )
                                 }
-                                if (stack.isNotEmpty()) TvButton("← Wstecz") {
-                                    current = stack.last()
-                                    stack = stack.dropLast(1)
+                                if (stack.isNotEmpty()) {
+                                    TvButton("Wstecz", NasGlyph.BACK) {
+                                        current = stack.last()
+                                        stack = stack.dropLast(1)
+                                    }
                                 }
                             }
                             Spacer(Modifier.height(12.dp))
                             if (activeRoot == null) {
-                                Column(Modifier.fillMaxSize()
-                                    .background(Color(0xFF122332), RoundedCornerShape(13.dp))
-                                    .padding(20.dp),
-                                    verticalArrangement = Arrangement.Center,
-                                    horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text("Dysk USB nie jest dostępny", color = Color.White,
-                                        fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                                    Spacer(Modifier.height(10.dp))
-                                    Text("Otwórz backend i zaakceptuj dostęp do urządzenia USB.",
-                                        color = Color(0xFFAAC0CB), fontSize = 13.sp)
-                                    Spacer(Modifier.height(15.dp))
-                                    TvButton("Otwórz obsługę USB") { launchBackend() }
+                                EmptyState(NasGlyph.USB, "Dysk USB nie jest dostępny",
+                                    "Sprawdź zasilanie, kabel i uprawnienia aplikacji NTFS.") {
+                                    launchBackend()
                                 }
                             } else if (entries.isEmpty()) {
-                                EmptyState("Folder jest pusty lub nie udało się odczytać plików.")
+                                EmptyState(NasGlyph.FOLDER, "Brak plików w tym folderze",
+                                    "Folder jest pusty lub odczyt nie powiódł się.") { refreshTick++ }
                             } else {
-                                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp),
-                                    contentPadding = PaddingValues(bottom = 22.dp)) {
+                                LazyColumn(
+                                    verticalArrangement = Arrangement.spacedBy(7.dp),
+                                    contentPadding = PaddingValues(bottom = 24.dp)
+                                ) {
                                     items(entries, key = { it.documentId }) { entry ->
                                         FileRow(entry) {
                                             if (entry.isDirectory) {
@@ -232,51 +264,75 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        Column(Modifier.width(258.dp).fillMaxHeight(),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Column(Modifier.width(250.dp).fillMaxHeight(),
+                            verticalArrangement = Arrangement.spacedBy(11.dp)) {
                             Column(Modifier.fillMaxWidth()
-                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
+                                .background(Color(0xFF142E3B), RoundedCornerShape(16.dp))
                                 .padding(16.dp)) {
-                                Text("Sparuj telefon", color = Color.White,
-                                    fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                                Spacer(Modifier.height(6.dp))
-                                Text("Wyślij plik bezpośrednio na dysk USB z telefonu.",
-                                    color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(Modifier.size(37.dp)
+                                        .background(Color(0xFF22535A), RoundedCornerShape(10.dp)),
+                                        contentAlignment = Alignment.Center) {
+                                        NasIcon(NasGlyph.PHONE, Modifier.size(23.dp), Color(0xFF66E4C9))
+                                    }
+                                    Spacer(Modifier.width(9.dp))
+                                    Text("Telefon → NAS", color = Color.White, fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(Modifier.height(10.dp))
+                                Text("Przesyłaj zdjęcia, filmy i inne pliki bezpośrednio na USB.",
+                                    color = Color(0xFFA8BFCC), fontSize = 12.sp, lineHeight = 17.sp)
                                 Spacer(Modifier.height(13.dp))
-                                TvButton("Pokaż kod QR") {
+                                TvButton("Sparuj przez QR", NasGlyph.QR, primary = true) {
                                     pairingUrl = uploadServer.beginPairing()
                                 }
                             }
+
                             Column(Modifier.fillMaxWidth().weight(1f)
-                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
-                                .padding(16.dp)) {
-                                Text("Ostatnie transfery", color = Color.White,
-                                    fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                                Spacer(Modifier.height(12.dp))
+                                .background(Color(0xFF112232), RoundedCornerShape(16.dp))
+                                .padding(15.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    NasIcon(NasGlyph.CLOCK, Modifier.size(19.dp), Color(0xFF66E4C9))
+                                    Spacer(Modifier.width(9.dp))
+                                    Text("Ostatnie transfery", color = Color.White,
+                                        fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(Modifier.height(13.dp))
                                 val history = remember(refreshTick) { uploadServer.recentTransfers }
                                 if (history.isEmpty()) {
-                                    Text("Nie przesłano jeszcze żadnych plików.",
-                                        color = Color(0xFFAAC0CB), fontSize = 13.sp)
+                                    Text("Brak ukończonych transferów.",
+                                        color = Color(0xFF9BB2C1), fontSize = 12.sp)
                                 } else {
                                     history.take(4).forEach { transfer ->
-                                        Text("✓  " + transfer.name, color = Color.White,
-                                            fontSize = 13.sp, maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis)
-                                        Text(formatSize(transfer.size),
-                                            color = Color(0xFF65DEC5), fontSize = 11.sp)
-                                        Spacer(Modifier.height(12.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            NasIcon(NasGlyph.CHECK, Modifier.size(16.dp),
+                                                Color(0xFF66E4C9))
+                                            Spacer(Modifier.width(7.dp))
+                                            Column(Modifier.weight(1f)) {
+                                                Text(transfer.name, color = Color.White,
+                                                    fontSize = 12.sp, maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis)
+                                                Text(formatSize(transfer.size) + " • Zakończono",
+                                                    color = Color(0xFF9FB8C8), fontSize = 11.sp)
+                                            }
+                                        }
+                                        Spacer(Modifier.height(13.dp))
                                     }
                                 }
                             }
+
                             Column(Modifier.fillMaxWidth()
-                                .background(Color(0xFF122332), RoundedCornerShape(14.dp))
-                                .padding(16.dp)) {
-                                Text("KOD AWARYJNY", color = Color(0xFFAAC0CB),
-                                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                Text(uploadServer.accessCode, color = Color(0xFF65DEC5),
-                                    fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                                Text("Widoczny na telewizorze", color = Color(0xFFAAC0CB),
-                                    fontSize = 11.sp)
+                                .background(Color(0xFF112232), RoundedCornerShape(14.dp))
+                                .padding(13.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    NasIcon(NasGlyph.INFO, Modifier.size(16.dp), Color(0xFF66E4C9))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("KOD AWARYJNY", color = Color(0xFF9FB8C8),
+                                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(Modifier.height(4.dp))
+                                Text(uploadServer.accessCode, color = Color(0xFF66E4C9),
+                                    fontSize = 22.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -286,18 +342,26 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SideNav(label: String, active: Boolean, onClick: () -> Unit) {
+    private fun SideNav(glyph: NasGlyph, label: String, active: Boolean, onClick: () -> Unit) {
         var focused by remember { mutableStateOf(false) }
         val shape = RoundedCornerShape(11.dp)
         val highlighted = focused || active
-        Box(Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }
-            .clip(shape)
-            .background(if (highlighted) Color(0xFF65DEC5) else Color(0xFF182D3C))
-            .border(if (focused) 2.dp else 0.dp, if (focused) Color.White else Color.Transparent, shape)
-            .clickable(onClick = onClick).focusable()
-            .padding(horizontal = 13.dp, vertical = 15.dp)) {
-            Text(label, color = if (highlighted) Color(0xFF08131D) else Color.White,
-                fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        Row(
+            Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }
+                .clip(shape)
+                .background(if (highlighted) Color(0xFF66E4C9) else Color.Transparent)
+                .border(if (focused) 2.dp else 0.dp,
+                    if (focused) Color.White else Color.Transparent, shape)
+                .clickable(onClick = onClick).focusable()
+                .padding(horizontal = 11.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            NasIcon(glyph, Modifier.size(19.dp),
+                if (highlighted) Color(0xFF09202A) else Color(0xFF9EB7C6))
+            Spacer(Modifier.width(11.dp))
+            Text(label, color = if (highlighted) Color(0xFF09202A) else Color(0xFFE0EAF1),
+                fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 
@@ -349,58 +413,167 @@ class MainActivity : ComponentActivity() {
         catch (e: SecurityException) { Toast.makeText(this, "Brak dostępu dla odtwarzacza", Toast.LENGTH_LONG).show() }
     }
 
-    @Composable private fun TvButton(label: String, onClick: () -> Unit) {
+    @Composable
+    private fun TvButton(
+        label: String,
+        glyph: NasGlyph,
+        primary: Boolean = false,
+        onClick: () -> Unit
+    ) {
         var focused by remember { mutableStateOf(false) }
-        Box(Modifier.onFocusChanged { focused = it.isFocused }.clip(RoundedCornerShape(10.dp))
-            .background(if (focused) Color(0xFF72D5C3) else Color(0xFF243B53)).clickable(onClick = onClick).focusable()
-            .padding(horizontal = 24.dp, vertical = 14.dp)) {
-            Text(label, color = if (focused) Color(0xFF07131F) else Color.White, fontWeight = FontWeight.Bold)
+        val shape = RoundedCornerShape(11.dp)
+        val bright = focused || primary
+        Row(
+            Modifier.onFocusChanged { focused = it.isFocused }
+                .clip(shape)
+                .background(if (bright) Color(0xFF66E4C9) else Color(0xFF223A4D))
+                .border(if (focused) 2.dp else 0.dp,
+                    if (focused) Color.White else Color.Transparent, shape)
+                .clickable(onClick = onClick).focusable()
+                .padding(horizontal = 15.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            NasIcon(glyph, Modifier.size(18.dp),
+                if (bright) Color(0xFF09202A) else Color.White)
+            Spacer(Modifier.width(9.dp))
+            Text(label, color = if (bright) Color(0xFF09202A) else Color.White,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 
-    @Composable private fun StatusCard(title: String, value: String, detail: String, ok: Boolean, modifier: Modifier = Modifier) {
-        Column(modifier.background(Color(0xFF102A43), RoundedCornerShape(12.dp)).padding(16.dp)) {
-            Text(title, color = Color(0xFF9FB3C8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-            Text(value, color = if (ok) Color(0xFF72D5C3) else Color(0xFFFFB4A9), fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            Text(detail, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-    }
-
-    @Composable private fun FileRow(entry: StorageEntry, onClick: () -> Unit) {
-        var focused by remember { mutableStateOf(false) }
-        Row(Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }.clip(RoundedCornerShape(12.dp))
-            .background(if (focused) Color(0xFF163A4A) else Color(0xFF102A43))
-            .border(2.dp, if (focused) Color(0xFF72D5C3) else Color.Transparent, RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick).focusable().padding(horizontal = 20.dp, vertical = 15.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text(if (entry.isDirectory) "📁" else fileIcon(entry.mimeType), fontSize = 28.sp, modifier = Modifier.size(46.dp))
-            Column(Modifier.weight(1f)) {
-                Text(entry.name, color = Color.White, fontSize = 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(fileDetails(entry), color = Color(0xFF9FB3C8), fontSize = 13.sp)
+    @Composable
+    private fun StatusCard(
+        glyph: NasGlyph, title: String, value: String, detail: String,
+        ok: Boolean, modifier: Modifier = Modifier
+    ) {
+        Row(
+            modifier.background(Color(0xFF142737), RoundedCornerShape(14.dp))
+                .padding(horizontal = 15.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(Modifier.size(40.dp).background(
+                if (ok) Color(0xFF1E4A4C) else Color(0xFF46373E),
+                RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
+                NasIcon(glyph, Modifier.size(23.dp),
+                    if (ok) Color(0xFF66E4C9) else Color(0xFFFFB7A5))
             }
-            Text(if (entry.isDirectory) "›" else "OK", color = Color(0xFF72D5C3), fontSize = 20.sp)
+            Spacer(Modifier.width(11.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = Color(0xFF9BB2C1), fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(value, color = if (ok) Color.White else Color(0xFFFFB7A5),
+                    fontSize = 16.sp, fontWeight = FontWeight.Bold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(detail, color = Color(0xFF9BB2C1), fontSize = 10.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
     }
 
-    @Composable private fun EmptyState(message: String) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(message, color = Color(0xFFBCCCDC), fontSize = 20.sp) }
+    @Composable
+    private fun FileRow(entry: StorageEntry, onClick: () -> Unit) {
+        var focused by remember { mutableStateOf(false) }
+        val shape = RoundedCornerShape(12.dp)
+        val glyph = when {
+            entry.isDirectory -> NasGlyph.FOLDER
+            entry.mimeType.startsWith("video/") -> NasGlyph.VIDEO
+            entry.mimeType.startsWith("audio/") -> NasGlyph.AUDIO
+            entry.mimeType.startsWith("image/") -> NasGlyph.IMAGE
+            else -> NasGlyph.DOCUMENT
+        }
+        val iconTint = when (glyph) {
+            NasGlyph.FOLDER -> Color(0xFFFFC777)
+            NasGlyph.VIDEO -> Color(0xFFBEA6FF)
+            NasGlyph.AUDIO -> Color(0xFFFF9AB6)
+            NasGlyph.IMAGE -> Color(0xFF83DBBA)
+            else -> Color(0xFF9DC9F9)
+        }
+        Row(
+            Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }
+                .clip(shape)
+                .background(if (focused) Color(0xFF22545B) else Color(0xFF142737))
+                .border(if (focused) 2.dp else 1.dp,
+                    if (focused) Color(0xFF66E4C9) else Color(0xFF1C3848), shape)
+                .clickable(onClick = onClick).focusable()
+                .padding(horizontal = 14.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(Modifier.size(42.dp)
+                .background(iconTint.copy(alpha = 0.13f), RoundedCornerShape(11.dp)),
+                contentAlignment = Alignment.Center) {
+                NasIcon(glyph, Modifier.size(25.dp), iconTint)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(entry.name, color = Color.White,
+                    fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(3.dp))
+                Text(fileDetails(entry), color = Color(0xFF9BB2C1),
+                    fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (entry.isDirectory) {
+                Text("›", color = if (focused) Color.White else Color(0xFF66E4C9),
+                    fontSize = 23.sp, fontWeight = FontWeight.Bold)
+            } else {
+                NasIcon(NasGlyph.INFO, Modifier.size(17.dp), Color(0xFF89A9B9))
+            }
+        }
     }
 
-    @Composable private fun PairingPanel(url: String) {
+    @Composable
+    private fun EmptyState(
+        glyph: NasGlyph, title: String, detail: String, action: () -> Unit
+    ) {
+        Column(Modifier.fillMaxSize()
+            .background(Color(0xFF142737), RoundedCornerShape(16.dp))
+            .padding(18.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            NasIcon(glyph, Modifier.size(47.dp), Color(0xFF66E4C9))
+            Spacer(Modifier.height(15.dp))
+            Text(title, color = Color.White, fontSize = 19.sp,
+                fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(7.dp))
+            Text(detail, color = Color(0xFF9BB2C1), fontSize = 12.sp,
+                textAlign = TextAlign.Center)
+            Spacer(Modifier.height(17.dp))
+            TvButton("Sprawdź ponownie", NasGlyph.REFRESH, onClick = action)
+        }
+    }
+
+    @Composable
+    private fun PairingPanel(url: String) {
         val bitmap = remember(url) { qrBitmap(url) }
         Row(
-            Modifier.fillMaxWidth().background(Color(0xFF102A43), RoundedCornerShape(16.dp)).padding(24.dp),
+            Modifier.fillMaxWidth().background(Color(0xFF142737),
+                RoundedCornerShape(18.dp)).padding(25.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(30.dp)
+            horizontalArrangement = Arrangement.spacedBy(29.dp)
         ) {
-            Image(bitmap.asImageBitmap(), contentDescription = "Kod QR do parowania telefonu", Modifier.size(270.dp).background(Color.White).padding(10.dp))
+            Image(bitmap.asImageBitmap(), contentDescription = "Kod QR do parowania telefonu",
+                modifier = Modifier.size(246.dp).clip(RoundedCornerShape(13.dp))
+                    .background(Color.White).padding(12.dp))
             Column(Modifier.weight(1f)) {
-                Text("Sparuj telefon", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(12.dp))
-                Text("1. Otwórz aparat w telefonie\n2. Zeskanuj kod QR\n3. Potwierdź otwarcie strony", color = Color(0xFFBCCCDC), fontSize = 18.sp, lineHeight = 28.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    NasIcon(NasGlyph.PHONE, Modifier.size(29.dp), Color(0xFF66E4C9))
+                    Spacer(Modifier.width(11.dp))
+                    Text("Połącz telefon z NAS", color = Color.White, fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold)
+                }
                 Spacer(Modifier.height(16.dp))
-                Text("Kod jest jednorazowy i ważny przez 2 minuty.", color = Color(0xFF72D5C3), fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                Text("Po sparowaniu ten telefon nie będzie już wymagał kodu.", color = Color.White, fontSize = 15.sp)
+                Text("1. Otwórz aparat w telefonie\n2. Zeskanuj kod QR\n3. Otwórz stronę przesyłania",
+                    color = Color(0xFFB5CAD7), fontSize = 17.sp, lineHeight = 29.sp)
+                Spacer(Modifier.height(15.dp))
+                Text("Kod ważny przez 2 minuty · jednorazowe parowanie",
+                    color = Color(0xFF66E4C9), fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text("Po sparowaniu telefon zostanie zapamiętany.",
+                    color = Color(0xFFAFBEC9), fontSize = 13.sp)
             }
         }
     }
@@ -413,9 +586,6 @@ class MainActivity : ComponentActivity() {
         return Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.RGB_565).apply { setPixels(pixels, 0, matrix.width, 0, 0, matrix.width, matrix.height) }
     }
 
-    private fun fileIcon(type: String) = when {
-        type.startsWith("video/") -> "🎬"; type.startsWith("audio/") -> "🎵"; type.startsWith("image/") -> "🖼"; else -> "📄"
-    }
     private fun fileDetails(entry: StorageEntry): String {
         if (entry.isDirectory) return "Folder"
         val size = entry.size.takeIf { it > 0 }?.let(::formatSize) ?: "Nieznany rozmiar"
